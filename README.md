@@ -1,8 +1,25 @@
 # zig-drive
 
-Filesystem-like API over cloud storage for [Fizzy](https://github.com/fizzyedit/fizzy). Google Drive is the first backend; Dropbox can be another `Fs` later. The explorer talks to ids (Drive file ids), not OS paths.
+A path-addressed, completion-based filesystem API over cloud storage, for
+[Fizzy](https://github.com/fizzyedit/fizzy). Google Drive is the first backend; Dropbox or
+OneDrive would be another `Fs` behind the same interface.
 
-Zig **0.16.0**. MIT. Same package shape as [md4zig](https://github.com/fizzyedit/md4zig): a module, not a plugin. No Fizzy or DVUI dependency.
+Zig **0.16.0**. MIT. Same package shape as [md4zig](https://github.com/fizzyedit/md4zig): a
+module, not a plugin. No Fizzy or DVUI dependency. Links for wasm32-freestanding.
+
+## Two decisions that shape the API
+
+**Paths, not ids.** A consumer already speaks paths everywhere (fizzy's file table, documents,
+explorer); an id-addressed API would force a second code path into each of them. Every op takes
+a `/`-rooted path *within the mount* — the host strips its own prefix (`gdrive://<account>`)
+before calling — and the Drive backend keeps the path→id map to itself, filling it lazily as
+directories are listed. Duplicate sibling names (Drive allows them) resolve first-listed-wins.
+
+**Async, not blocking.** wasm32-freestanding is single-threaded and cannot wait on `fetch`, so a
+synchronous `readFile() -> []u8` is unimplementable on the one target this exists for. Every op
+starts a `Job` and completes through a callback that runs only from `pump()`, on the calling
+thread — once per frame, in fizzy. A backend that can answer immediately (`Mem`) still defers to
+`pump`, so a consumer sees one timing everywhere.
 
 ## Use from a Zig project
 
@@ -11,37 +28,55 @@ zig fetch --save git+https://github.com/fizzyedit/zig-drive
 ```
 
 ```zig
-const zig_drive = b.dependency("zig_drive", .{
-    .target = target,
-    .optimize = optimize,
-});
+const zig_drive = b.dependency("zig_drive", .{ .target = target, .optimize = optimize });
 mod.addImport("zig_drive", zig_drive.module("zig_drive"));
 ```
 
 ```zig
 const drive = @import("zig_drive");
 
-var mem_fs = try drive.Mem.init(allocator);
-defer mem_fs.deinit();
-const fs = mem_fs.fs();
+var mem = try drive.Mem.init(allocator);
+defer mem.deinit();
+const fs = mem.fs();
 
-const entries = try fs.listDir(allocator, drive.Mem.root_id);
-defer drive.freeEntries(allocator, entries);
+fn onList(ctx: ?*anyopaque, result: drive.Error![]drive.Entry) void {
+    const entries = result catch |err| return handle(err);
+    defer drive.freeEntries(allocator, entries);
+    // …
+}
+
+_ = try fs.listDir(allocator, "/", onList, null);
+// each frame:
+fs.pump();
 ```
 
-Drive is the same `Fs`, with HTTP and the bearer token injected by the host:
+Google Drive is the same `Fs`, with HTTP and the bearer token injected by the host:
 
 ```zig
-var client: drive.drive.Client = .{
-    .allocator = allocator,
-    .transport = my_transport, // http.Transport — you implement requestFn
-    .access_token = access_token,
-};
+var client = try drive.drive.Client.init(allocator, my_transport, access_token, "root");
+defer client.deinit();
 const fs = client.fs();
-const listing = try fs.listDir(allocator, "root"); // or a picked folder id
 ```
 
-`listDir` / `readFile` / `stat` hit Drive v3 (`files.list`, `files.get`, `files.get?alt=media`). `writeFile` / `createFile` / `mkdir` / `remove` return `error.Unsupported` until a later slice. Google Docs / Sheets MIME types return `error.NotBinary`.
+`root_id` is `"root"` for My Drive or the id of a picked folder — the mount's `/` is whatever
+the host says it is; the API does not know the difference.
+
+| `Fs` op | Drive v3 |
+|---|---|
+| `listDir` | `files.list` with `'<id>' in parents and trashed=false`, paginated |
+| `stat` | answered from the index (lists ancestors on a cold path) |
+| `readFile` | `files.get?alt=media` — a Google Doc/Sheet is `error.NotBinary` |
+| `writeFile` | `PATCH upload/…/files/<id>?uploadType=media` |
+| `createFile` / `mkdir` | `POST files` with `{name, parents[, mimeType]}` — metadata only, no multipart |
+| `rename` | `PATCH files/<id>?addParents=&removeParents=` with `{name}` |
+| `remove` | `PATCH files/<id>` with `{trashed: true}`; a non-empty directory is `error.NotEmpty` |
+
+Errors split `Unauthorized` (refresh the token and retry) from `Forbidden` (the token is fine,
+the op is not allowed).
+
+`http.Transport` has the same completion shape: `request(allocator, req, cb, ctx)` returns a
+job, `pump()` delivers. Native wraps `std.http` on a thread; wasm calls JS `fetch` and completes
+from the callback export. `src/drive_test.zig` has a scripted transport to copy.
 
 ## Build
 
@@ -50,42 +85,16 @@ zig build test
 zig build check-wasm   # wasm32-freestanding link, Fizzy's web target
 ```
 
-## How Google Drive access actually works
+## What the host still owns
 
-The library speaks REST. The **host** (Fizzy native vs web) must supply HTTP and login.
+- **HTTP** — `http.Transport`.
+- **OAuth** — native: desktop client, PKCE, system browser + loopback, refresh token persisted
+  by the host. Web: Google Identity Services token client (Google will not do a browser PKCE
+  code exchange for a Web client without a secret) — 1-hour tokens, silent re-request. Both
+  hand this library a bearer string; it sees `Authorization: Bearer …` and nothing else.
+- **Scopes** — `drive.file` plus a folder picker ships without restricted-scope review; full
+  `drive` is the same API with `root_id = "root"` and a harder Google review.
+- **Freshness** — `changes.list` polling is the host's; on a change it calls `Client.forget(path)`.
 
-### GCP (once)
-
-1. Google Cloud project, enable **Google Drive API**.
-2. OAuth consent screen.
-3. Two OAuth clients:
-   - **Web** — JS origin `https://fizzyed.it` and localhost for `zig build` web.
-   - **Desktop** — native loopback.
-
-### Scopes
-
-Start with `drive.file` plus Google Picker (or an equivalent folder chooser) so the explorer root is a folder the user granted. That ships without restricted-scope verification.
-
-Full `https://www.googleapis.com/auth/drive` is the same zig-drive API with a different root id and a harder Google review. Do not bake “My Drive vs picked folder” into `Fs`.
-
-### OAuth
-
-PKCE. Native: system browser + loopback. Web: popup / redirect on fizzyed.it.
-
-Tokens stay in the **host**. Refresh is host-side. zig-drive only sees `Authorization: Bearer …`.
-
-### Transport
-
-`http.Transport.requestFn` must support GET/POST/PATCH and arbitrary headers. Native can wrap `std.http`. Wasm cannot use `std.http`; call JS `fetch`.
-
-## Fizzy follow-up (not this package)
-
-A working zig-drive is not enough to draw the explorer. Today:
-
-1. `FileTable.listDir` is hardcoded to `Io.Dir`. Give it an `Fs` (local adapter + Drive).
-2. Point `sdk.services.files.Api` at the same `Fs` for open/save (that service is already replaceable).
-3. `fizzy_web_fetch` is GET-only and cannot set auth headers. Extend it for method + headers and implement `Transport` in `web_io.zig`.
-4. Replace `WebFolderUnavailable` (“The file explorer is not available in the browser”) with Connect Google Drive.
-5. Persist tokens in existing ZON settings (`settings.zon`), not a new plugin.
-
-Native gets the same `Fs`: local disk and Drive side by side (open a Drive folder as the project root).
+The fizzy side of this (mount table, `FileTable` routing, the `drive` plugin) is planned in
+fizzy's `docs/CLOUD_FS_PLAN.md`.
