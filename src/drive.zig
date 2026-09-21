@@ -61,12 +61,21 @@ pub const Client = struct {
     /// `changes.list` page token: where the next poll continues from. Owned; null until the
     /// first poll fetched a start token.
     changes_token: ?[]u8 = null,
+    /// Set when Drive answered 401 to any request: the token is dead before its clock said so.
+    /// The owner reads and clears it (`takeUnauthorized`) to refresh at once.
+    unauthorized: bool = false,
     jobs: std.AutoArrayHashMapUnmanaged(u64, *Job) = .empty,
     ready: http.Completions(*Job),
     /// The job whose callback `pump` is inside, so a cancel of it from that callback is a
     /// no-op rather than a use-after-free.
     delivering: ?*Job = null,
     initialised: bool = false,
+
+    /// Whether a 401 arrived since the last call; cleared by the call.
+    pub fn takeUnauthorized(self: *Client) bool {
+        defer self.unauthorized = false;
+        return self.unauthorized;
+    }
 
     pub fn init(allocator: Allocator, transport: http.Transport, access_token: []const u8, root_id: []const u8) Allocator.Error!Client {
         var self: Client = .{
@@ -609,6 +618,7 @@ const Job = struct {
                 // Drive's error bodies say why (scope, disabled API, a wrong id); a bare
                 // error code would not.
                 std.log.warn("drive: {s} → HTTP {d}: {s}", .{ job.url, resp.status, resp.body[0..@min(resp.body.len, 400)] });
+                if (resp.status == 401) job.client.unauthorized = true;
                 return switch (resp.status) {
                     401 => error.Unauthorized,
                     403 => error.Forbidden,

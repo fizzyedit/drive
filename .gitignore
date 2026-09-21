@@ -4,3 +4,4 @@ zig-out/
 *.o
 *.obj
 credentials.zon
+zig-pkg/

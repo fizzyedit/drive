@@ -339,8 +339,14 @@ fn beginFrame(ptr: *anyopaque) void {
         }
     }
 
-    // Refresh ahead of expiry while mounted, so a listing never has to fail first.
-    if (st.phase == .mounted and st.pending == null and st.expires_at_ms != 0 and nowMs() > st.expires_at_ms - 120_000) {
+    // Refresh ahead of expiry while mounted, so a listing never has to fail first — and at
+    // once when one did anyway with a 401 (the token was revoked, or the clock was wrong),
+    // rather than leaving the tree dead until the timer says so.
+    var stale = st.expires_at_ms != 0 and nowMs() > st.expires_at_ms - 120_000;
+    if (st.client) |client| {
+        if (client.takeUnauthorized()) stale = true;
+    }
+    if (st.phase == .mounted and st.pending == null and stale) {
         if (is_wasm) requestWebToken(st, true) else startRefresh(st);
     }
 }
