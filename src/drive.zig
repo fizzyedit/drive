@@ -198,9 +198,9 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return self.start(path, null, .{ .read = .{ .allocator = allocator, .cb = cb, .ctx = ctx } });
     }
-    fn startWriteFile(ptr: *anyopaque, path: []const u8, bytes: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
+    fn startWriteFile(ptr: *anyopaque, path: []const u8, bytes: []const u8, opts: Fs.WriteOptions, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        return self.start(path, null, .{ .write = .{ .bytes = bytes, .cb = cb, .ctx = ctx } });
+        return self.start(path, null, .{ .write = .{ .bytes = bytes, .opts = opts, .cb = cb, .ctx = ctx } });
     }
     fn startCreateFile(ptr: *anyopaque, path: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         const self: *Client = @ptrCast(@alignCast(ptr));
@@ -311,6 +311,8 @@ const Job = struct {
     seen: std.ArrayList([]const u8) = .empty,
     /// A changes poll's paths, accumulated across its pages. Owned (client allocator).
     changed: std.ArrayList([]u8) = .empty,
+    /// A conditional write's `modifiedTime` check has come back and matched.
+    write_checked: bool = false,
 
     pending: ?http.Job = null,
     url: []u8 = &.{},
@@ -336,7 +338,7 @@ const Job = struct {
         list: struct { allocator: Allocator, cb: Fs.ListDirFn, ctx: ?*anyopaque },
         stat: struct { cb: Fs.StatFn, ctx: ?*anyopaque },
         read: struct { allocator: Allocator, cb: Fs.ReadFn, ctx: ?*anyopaque },
-        write: struct { bytes: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque },
+        write: struct { bytes: []const u8, opts: Fs.WriteOptions, cb: Fs.DoneFn, ctx: ?*anyopaque },
         create: struct { kind: Fs.Kind, cb: Fs.DoneFn, ctx: ?*anyopaque },
         rename: struct { cb: Fs.DoneFn, ctx: ?*anyopaque },
         remove: struct { cb: Fs.DoneFn, ctx: ?*anyopaque },
@@ -349,7 +351,7 @@ const Job = struct {
         err: Fs.Error,
         entries: []Fs.Entry,
         stat: Fs.Stat,
-        bytes: []u8,
+        read: Fs.Read,
         changed: [][]u8,
         ok,
     };
@@ -363,7 +365,7 @@ const Job = struct {
         job.seen.deinit(a);
         switch (job.result) {
             .entries => |entries| Fs.freeEntries(job.op.list.allocator, entries),
-            .bytes => |bytes| job.op.read.allocator.free(bytes),
+            .read => |r| job.op.read.allocator.free(r.bytes),
             .changed => |paths| Client.freeChanges(job.op.changes.allocator, paths),
             else => {},
         }
@@ -414,7 +416,7 @@ const Job = struct {
                 else => unreachable,
             }),
             .read => |o| o.cb(o.ctx, switch (result) {
-                .bytes => |b| b,
+                .read => |r| r,
                 .err => |e| e,
                 else => unreachable,
             }),
@@ -513,6 +515,13 @@ const Job = struct {
             .write => |o| {
                 if (node.kind != .file) return error.NotAFile;
                 if (node.google_app) return error.NotBinary;
+                if (o.opts.if_unmodified_ms != null and !job.write_checked) {
+                    // The index's modified time may be seconds stale; ask Drive for the live
+                    // one before uploading over someone else's edit.
+                    const url = try std.fmt.allocPrint(a, "{s}/{s}?fields=modifiedTime", .{ api, node.id });
+                    job.phase = .request;
+                    return client.send(job, .GET, url, null, &.{}, null);
+                }
                 const url = try std.fmt.allocPrint(a, "{s}/{s}?uploadType=media&fields={s}", .{ upload_api, node.id, file_fields });
                 job.phase = .request;
                 try client.send(job, .PATCH, url, "application/octet-stream", o.bytes, null);
@@ -675,8 +684,25 @@ const Job = struct {
         const client = job.client;
         const a = client.allocator;
         switch (job.op) {
-            .read => |o| job.complete(.{ .bytes = try o.allocator.dupe(u8, body) }),
-            .write => {
+            .read => |o| {
+                const mtime = if (client.index.get(job.path)) |n| n.modified_ms else 0;
+                job.complete(.{ .read = .{ .bytes = try o.allocator.dupe(u8, body), .modified_ms = mtime } });
+            },
+            .write => |o| {
+                if (o.opts.if_unmodified_ms != null and !job.write_checked) {
+                    // The metadata check. Match → upload; else nothing is written.
+                    const file = try parseFile(a, body);
+                    defer file.deinit();
+                    const live = parseRfc3339Ms(file.value.modifiedTime);
+                    if (live != o.opts.if_unmodified_ms.?) {
+                        if (client.index.getPtr(job.path)) |node| node.modified_ms = live;
+                        return error.Conflict;
+                    }
+                    job.write_checked = true;
+                    job.phase = .resolve;
+                    job.resolving = "";
+                    return job.stepInner();
+                }
                 if (parseFile(a, body)) |file| {
                     defer file.deinit();
                     if (client.index.getPtr(job.path)) |node| {
@@ -798,8 +824,8 @@ const Job = struct {
 // -- Drive JSON -------------------------------------------------------------------------------
 
 const File = struct {
-    id: []const u8,
-    name: []const u8,
+    id: []const u8 = "",
+    name: []const u8 = "",
     mimeType: []const u8 = "",
     size: ?[]const u8 = null,
     modifiedTime: ?[]const u8 = null,

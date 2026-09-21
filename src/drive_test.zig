@@ -87,6 +87,7 @@ const Sink = struct {
     entries: ?[]Fs.Entry = null,
     bytes: ?[]u8 = null,
     stat: ?Fs.Stat = null,
+    modified_ms: i64 = 0,
     err: ?Fs.Error = null,
     calls: usize = 0,
 
@@ -111,13 +112,15 @@ const Sink = struct {
             return;
         };
     }
-    fn onRead(ctx: ?*anyopaque, result: Fs.Error![]u8) void {
+    fn onRead(ctx: ?*anyopaque, result: Fs.Error!Fs.Read) void {
         const self: *Sink = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
-        self.bytes = result catch |err| {
+        const r = result catch |err| {
             self.err = err;
             return;
         };
+        self.bytes = r.bytes;
+        self.modified_ms = r.modified_ms;
     }
     fn onDone(ctx: ?*anyopaque, result: Fs.Error!void) void {
         const self: *Sink = @ptrCast(@alignCast(ctx.?));
@@ -146,7 +149,7 @@ const root_page2 =
     \\{"files":[{"id":"t1","name":"top.txt","mimeType":"text/plain","size":"5"}]}
 ;
 const notes_page =
-    \\{"files":[{"id":"a1","name":"a.txt","mimeType":"text/plain","size":"7"},{"id":"d1","name":"Doc","mimeType":"application/vnd.google-apps.document"}]}
+    \\{"files":[{"id":"a1","name":"a.txt","mimeType":"text/plain","size":"7","modifiedTime":"2024-01-01T00:00:00Z"},{"id":"d1","name":"Doc","mimeType":"application/vnd.google-apps.document"}]}
 ;
 const little_drive = [_]Scripted.Route{
     .{ .contains = "changes/startPageToken", .body = "{\"startPageToken\":\"100\"}" },
@@ -157,6 +160,8 @@ const little_drive = [_]Scripted.Route{
     .{ .contains = "q=%27root%27%20in%20parents", .body = root_page1 },
     .{ .contains = "q=%27n1%27%20in%20parents", .body = notes_page },
     .{ .contains = "files/a1?alt=media", .body = "content" },
+    // The live metadata says someone saved a.txt a day after the listing.
+    .{ .contains = "files/a1?fields=modifiedTime", .method = .GET, .body = "{\"modifiedTime\":\"2024-01-02T00:00:00Z\"}" },
     .{ .contains = "files/d1?alt=media", .body = "never" },
     .{ .contains = "upload/drive/v3/files/a1?uploadType=media", .method = .PATCH, .body = 
         \\{"id":"a1","name":"a.txt","mimeType":"text/plain","size":"3","modifiedTime":"2024-06-01T00:00:00Z"}
@@ -252,7 +257,7 @@ test "readFile fetches media; a Google Doc is NotBinary before any download" {
 test "writeFile uploads media and refreshes size/mtime" {
     const h = try Harness.init(std.testing.allocator, &little_drive);
     defer h.deinit();
-    _ = try h.fs().writeFile("/notes/a.txt", "abc", Sink.onDone, &h.sink);
+    _ = try h.fs().writeFile("/notes/a.txt", "abc", .{}, Sink.onDone, &h.sink);
     try settle(h.fs(), &h.sink);
     try std.testing.expect(h.sink.err == null);
     const last = h.scripted.log.items[h.scripted.log.items.len - 1];
@@ -262,6 +267,28 @@ test "writeFile uploads media and refreshes size/mtime" {
     _ = try h.fs().stat("/notes/a.txt", Sink.onStat, &h.sink);
     try settle(h.fs(), &h.sink);
     try std.testing.expectEqual(@as(u64, 3), h.sink.stat.?.size);
+}
+
+test "a conditional write checks Drive's live modifiedTime and refuses a stale one" {
+    const a = std.testing.allocator;
+    const h = try Harness.init(a, &little_drive);
+    defer h.deinit();
+    _ = try h.fs().readFile(a, "/notes/a.txt", Sink.onRead, &h.sink);
+    try settle(h.fs(), &h.sink);
+    const seen = h.sink.modified_ms;
+    try std.testing.expect(seen != 0);
+    h.sink.reset();
+    _ = try h.fs().writeFile("/notes/a.txt", "mine", .{ .if_unmodified_ms = seen }, Sink.onDone, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(Fs.Error.Conflict, h.sink.err.?);
+    // No upload happened.
+    for (h.scripted.log.items) |l| try std.testing.expect(l.method != .PATCH);
+    // With the live time it goes through.
+    h.sink.reset();
+    _ = try h.fs().writeFile("/notes/a.txt", "mine", .{ .if_unmodified_ms = 1_704_153_600_000 }, Sink.onDone, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expect(h.sink.err == null);
+    try std.testing.expectEqual(http.Method.PATCH, h.scripted.log.items[h.scripted.log.items.len - 1].method);
 }
 
 test "createFile posts metadata with the parent id; a second create is Exists" {
