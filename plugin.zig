@@ -20,6 +20,8 @@ const core = @import("core");
 const Settings = @import("src/Settings.zig");
 const oauth = @import("src/oauth.zig");
 const drive = @import("src/drive.zig");
+/// The app's OAuth clients, baked in at build time (see `credentials.zon.example`).
+const credentials = @import("credentials.zon");
 
 const vfs = core.vfs;
 const is_wasm = builtin.target.cpu.arch == .wasm32;
@@ -151,15 +153,9 @@ fn initPlugin(ptr: *anyopaque) anyerror!void {
     }
     st.ready = true;
 
-    // A saved refresh token means the user signed in before: pick up where they left off. It
-    // lives in the host's secret store; one left in settings by an earlier build moves over.
-    if (!is_wasm) {
-        if (st.settings.refresh_token.get().len != 0) {
-            sdk.host().setSecret(secret_refresh_token, st.settings.refresh_token.get()) catch {};
-            setSetting(st, "refresh_token", "");
-        }
-        if (refreshToken(st).len != 0) startRefresh(st);
-    }
+    // A saved refresh token (the host's secret store) means the user signed in before: pick
+    // up where they left off.
+    if (!is_wasm and refreshToken(st).len != 0) startRefresh(st);
 }
 
 pub fn pluginPtr() *sdk.Plugin {
@@ -201,8 +197,11 @@ fn storeRefreshToken(value: []const u8) void {
     };
 }
 
-fn scopeOf(st: *State) []const u8 {
-    return if (st.settings.full_access.get()) oauth.scope_full else oauth.scope_file;
+/// The whole drive, always: with `drive.file` a fresh sign-in shows an empty drive and the
+/// desktop has no picker to change that. Publishing an app with this scope needs Google's
+/// verification; testers can use it meanwhile (README).
+fn scopeOf(_: *State) []const u8 {
+    return oauth.scope_full;
 }
 
 fn nowMs() i64 {
@@ -292,12 +291,12 @@ fn signIn(st: *State) void {
     if (st.phase == .awaiting_code) signOut(st, false);
     if (st.phase != .signed_out) return;
     if (is_wasm) {
-        if (st.settings.web_client_id.get().len == 0) return complain("Set the web OAuth client ID in Settings › Google Drive first.");
+        if (credentials.web_client_id.len == 0) return complain("This build of the Drive plugin has no web OAuth client configured.");
         st.phase = .token;
         requestWebToken(st, false);
         return;
     }
-    if (st.settings.client_id.get().len == 0) return complain("Set the desktop OAuth client ID in Settings › Google Drive first.");
+    if (credentials.client_id.len == 0) return complain("This build of the Drive plugin has no OAuth client configured.");
     startDesktopFlow(st) catch |err| {
         dvui.log.err("drive: could not start sign-in: {t}", .{err});
         complain("Could not start Google sign-in; see the log.");
@@ -310,7 +309,7 @@ fn startDesktopFlow(st: *State) !void {
     st.pkce = oauth.Pkce.generate(dvui.io);
     const loopback = try oauth.Loopback.start(gpa, dvui.io, st.pkce.state);
     errdefer loopback.stop();
-    const url = try oauth.authUrl(gpa, st.settings.client_id.get(), scopeOf(st), loopback.port(), &st.pkce);
+    const url = try oauth.authUrl(gpa, credentials.client_id, scopeOf(st), loopback.port(), &st.pkce);
     defer gpa.free(url);
     if (!dvui.openURL(.{ .url = url })) return error.CouldNotOpenBrowser;
     st.loopback = loopback;
@@ -343,7 +342,7 @@ fn pollLoopback(st: *State) void {
 fn startExchange(st: *State, code: []const u8, port: u16) void {
     if (is_wasm) return;
     const gpa = sdk.allocator();
-    const body = oauth.exchangeBody(gpa, st.settings.client_id.get(), st.settings.client_secret.get(), code, port, &st.pkce) catch return fail(st, "out of memory");
+    const body = oauth.exchangeBody(gpa, credentials.client_id, credentials.client_secret, code, port, &st.pkce) catch return fail(st, "out of memory");
     st.phase = .token;
     postForm(st, oauth.token_endpoint, body, onToken);
 }
@@ -351,7 +350,7 @@ fn startExchange(st: *State, code: []const u8, port: u16) void {
 fn startRefresh(st: *State) void {
     if (is_wasm) return;
     const gpa = sdk.allocator();
-    const body = oauth.refreshBody(gpa, st.settings.client_id.get(), st.settings.client_secret.get(), refreshToken(st)) catch return fail(st, "out of memory");
+    const body = oauth.refreshBody(gpa, credentials.client_id, credentials.client_secret, refreshToken(st)) catch return fail(st, "out of memory");
     if (st.phase == .signed_out) st.phase = .token;
     postForm(st, oauth.token_endpoint, body, onToken);
 }
@@ -581,7 +580,7 @@ fn requestWebToken(st: *State, silent: bool) void {
         _ = std.base64.url_safe_no_pad.Encoder.encode(state_buf, &nonce);
         st.web_state = state_buf;
     }
-    const url = oauth.implicitAuthUrl(gpa, st.settings.web_client_id.get(), scopeOf(st), redirect, st.web_state, silent) catch return fail(st, "out of memory");
+    const url = oauth.implicitAuthUrl(gpa, credentials.web_client_id, scopeOf(st), redirect, st.web_state, silent) catch return fail(st, "out of memory");
     defer gpa.free(url);
     core.transport.WebOAuth.begin(gpa, url, onWebOAuth, st) catch return fail(st, "a sign-in is already open");
 }

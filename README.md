@@ -44,10 +44,11 @@ console).
 
 - User type: **External**.
 - App name `fizzy`, your email as user-support and developer contact. Logo/links optional.
-- **Scopes** → *Add or remove scopes* → tick
-  `https://www.googleapis.com/auth/drive.file`
-  ("See, edit, create, and delete only the specific Google Drive files you use with this app").
-  This is a *non-sensitive* scope: no Google review is needed to publish.
+- **Scopes** → *Add or remove scopes* → tick `https://www.googleapis.com/auth/drive`
+  ("See, edit, create, and delete all of your Google Drive files"). The plugin always asks
+  for the whole drive — with the narrower `drive.file` a fresh sign-in shows an empty drive
+  and the desktop has no picker to change that. It is a *restricted* scope: testers can use it
+  as soon as it is added, and publishing to everyone later means Google's app verification.
 - **Test users** → add your own Google account(s). While the app's *Publishing status* is
   **Testing**, only listed accounts can sign in (max 100). When it is time for strangers to
   use it, press **Publish app** — with only `drive.file` requested that takes effect
@@ -59,34 +60,29 @@ console).
 
 | Client | Type | Settings | Goes into |
 |---|---|---|---|
-| desktop | **Desktop app** | none | `Settings › Google Drive › OAuth client ID (desktop)` and `… client secret (desktop)` |
-| web | **Web application** | *Authorized JavaScript origins*: `http://localhost:8765` for the local dev server, plus the real origin the web build is served from (e.g. `https://fizzyed.it`). *Authorized redirect URIs*: the same origins with `/oauth-callback.html` appended — `http://localhost:8765/oauth-callback.html`. | `Settings › Google Drive › OAuth client ID (web)` |
+| desktop | **Desktop app** | none | `credentials.zon` → `client_id`, `client_secret` |
+| web | **Web application** | *Authorized JavaScript origins*: `http://localhost:8765` for the local dev server, plus the real origin the web build is served from (e.g. `https://fizzyed.it`). *Authorized redirect URIs*: the same origins with `/oauth-callback.html` appended — `http://localhost:8765/oauth-callback.html`. | `credentials.zon` → `web_client_id` |
 
 Google issues the desktop client a "secret" and requires it at the token exchange even though
 a desktop app cannot keep a secret — Google's own docs say so. It is the *app's* credential,
 not any user's, and is safe to ship as a default; it does not grant access to anything by
 itself.
 
-### 5. Bake the IDs in
+### 5. Put the IDs in `credentials.zon`
 
-Until they are defaults in `plugins/drive/src/Settings.zig`, paste them into
-**Settings › Google Drive** in the running app (they persist to `settings.zon`). To make them
-the shipped defaults, set the `.init("…")` values of `client_id`, `client_secret` and
-`web_client_id` there.
+```sh
+cp credentials.zon.example credentials.zon   # gitignored
+```
 
-## What users see, and the scope's one limit
+Fill in `client_id`, `client_secret` (desktop) and `web_client_id`, then `zig build`. They are
+baked into the plugin; users never see them. CI does the same from the environment —
+`FIZZY_DRIVE_CLIENT_ID`, `FIZZY_DRIVE_CLIENT_SECRET`, `FIZZY_DRIVE_WEB_CLIENT_ID` — because
+`zig build` generates `credentials.zon` from those when the file is missing.
 
-With `drive.file`, fizzy can only see files **it created** or the user **explicitly picked**.
-So a freshly connected drive looks empty until something is created from fizzy or chosen.
+## What users see
 
-- **Settings › Google Drive › Full Drive access** switches to the full `drive` scope, which
-  shows the whole drive. Add that scope on the consent screen too, and sign out and in again.
-  While the app is in *Testing* that is all it takes; *publishing* with the full scope requires
-  Google's app verification (privacy policy, a demo video, a few weeks), which is why the
-  default stays `drive.file`.
-- Under `drive.file`, a folder's ID pasted into **Root folder id** only helps if fizzy has
-  been granted that folder — which on the desktop it cannot be, since there is no Picker
-  outside a browser. The web Picker is not built yet.
+The whole drive as a folder, `gdrive://<account>`. **Settings › Google Drive › Root folder
+id** narrows the mount to one folder (its id is in the folder's Drive URL).
 
 ## How it works
 
