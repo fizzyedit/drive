@@ -561,22 +561,22 @@ fn providerSignIn(ctx: ?*anyopaque) void {
     if (st.phase == .signed_out) signIn(st);
 }
 
-/// The account's submenu rows. True when one was chosen.
+/// The account's submenu rows, drawn by the host (`Host.drawMenuItem`): a dylib's own dvui has
+/// no open menu to put an item in. True when one was chosen.
 fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
     const st: *State = @ptrCast(@alignCast(ctx.?));
-    const opts: dvui.Options = .{ .expand = .horizontal, .color_text = .{ .color = dvui.themeGet().color(.control, .text) } };
-    if (dvui.menuItemLabel(@src(), "Open Google Drive Folder…", .{}, opts) != null) {
+    const host = sdk.host();
+    if (host.drawMenuItem("Open Google Drive Folder…", sdk.Plugin.commandId(plugin_id, "open_folder"))) {
         FolderChooser.open(st.prefix);
         return true;
     }
     if (!rootIsDrive(st)) {
-        if (dvui.menuItemLabel(@src(), "Open Google Drive", .{}, opts) != null) {
+        if (host.drawMenuItem("Open Google Drive", sdk.Plugin.commandId(plugin_id, "open"))) {
             openAsRoot(st);
             return true;
         }
     }
-    _ = dvui.separator(@src(), .{ .expand = .horizontal });
-    if (dvui.menuItemLabel(@src(), "Sign out", .{}, opts) != null) {
+    if (host.drawMenuItem("Sign out", sdk.Plugin.commandId(plugin_id, "sign_out"))) {
         signOut(st, true);
         return true;
     }
