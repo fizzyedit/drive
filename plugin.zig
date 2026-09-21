@@ -22,6 +22,7 @@ const oauth = @import("src/oauth.zig");
 const drive = @import("src/drive.zig");
 /// The app's OAuth clients, baked in at build time (see `credentials.zon.example`).
 const credentials = @import("credentials.zon");
+const icons = @import("icons");
 /// Google's Picker wants an API key beside the token. Older `credentials.zon` files predate
 /// the field; without it the folder picker says so instead of opening.
 const api_key: []const u8 = if (@hasField(@TypeOf(credentials), "api_key")) credentials.api_key else "";
@@ -125,13 +126,15 @@ pub fn register(host: *sdk.Host) !void {
         .title = "Connect Google Drive…",
         .run = cmdSignIn,
         .isEnabled = cmdSignInEnabled,
+        .icon = icons.tvg.lucide.@"log-in",
     });
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "open"),
         .owner = &plugin,
-        .title = "Open Whole Drive",
+        .title = "Open Drive",
         .run = cmdOpen,
         .isEnabled = cmdOpenEnabled,
+        .icon = icons.tvg.lucide.@"hard-drive",
     });
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "open_folder"),
@@ -139,6 +142,7 @@ pub fn register(host: *sdk.Host) !void {
         .title = "Open Drive Folder",
         .run = cmdOpenFolder,
         .isEnabled = cmdMounted,
+        .icon = icons.tvg.lucide.@"folder-open",
     });
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "sign_out"),
@@ -146,6 +150,7 @@ pub fn register(host: *sdk.Host) !void {
         .title = "Disconnect Google Drive",
         .run = cmdSignOut,
         .isEnabled = cmdSignOutEnabled,
+        .icon = icons.tvg.lucide.@"log-out",
     });
     try host.registerOpenAction(.{
         .id = "drive.open_folder",
@@ -737,7 +742,7 @@ fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
         return true;
     }
     if (!rootIsDrive(st)) {
-        if (host.drawMenuItem("Open Whole Drive", sdk.Plugin.commandId(plugin_id, "open"))) {
+        if (host.drawMenuItem("Open Drive", sdk.Plugin.commandId(plugin_id, "open"))) {
             openAsRoot(st);
             return true;
         }

@@ -15,6 +15,12 @@
     },
     .fingerprint = 0x681df58f0316cd49,
     .dependencies = .{
+        // Menu icons (lucide), the same set fizzy's own commands use.
+        .icons = .{
+            .url = "https://github.com/foxnne/zig-lib-icons/archive/db034786a1286ab28dc35aba534c098aa4f1a3aa.tar.gz",
+            .hash = "icons-0.0.0-iJxA-VvGMwAgiKSXRe_Y0O7RpasdtEJhBfVx8IGGEBl_",
+            .lazy = true,
+        },
         // Locally the SDK next door; a release pins the `fizzy-sdk-v*` asset URL instead.
         .fizzy = .{
             .path = "../../fizzy/sdk",

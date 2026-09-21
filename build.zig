@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
     ensureCredentials(b);
 
     const plugin = fizzy.plugin.create(b, .{ .target = target, .optimize = optimize });
+    if (b.lazyDependency("icons", .{ .target = target, .optimize = optimize })) |dep| {
+        plugin.module.addImport("icons", dep.module("icons"));
+    }
     fizzy.plugin.install(b, plugin.lib, .{});
 
     // The plugin module carries the tests that need `core` (the Drive client over a scripted
