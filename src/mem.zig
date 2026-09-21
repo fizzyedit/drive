@@ -12,8 +12,11 @@ pub const Mem = struct {
     /// Keyed by full path (`/docs/a.txt`). The root `/` is always present.
     nodes: std.StringArrayHashMapUnmanaged(Node) = .empty,
     completions: http.Completions(Completion),
+    /// Bumped by every mutation, so a holder (an archive that was unpacked into this) can tell
+    /// whether anything changed since it last looked.
+    generation: u64 = 0,
 
-    const Node = struct {
+    pub const Node = struct {
         kind: Fs.Kind,
         bytes: []u8 = &.{},
         modified_ms: i64 = 0,
@@ -104,6 +107,7 @@ pub const Mem = struct {
         const copy = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(copy);
         try self.nodes.put(self.allocator, key, .{ .kind = kind, .bytes = copy });
+        self.generation += 1;
     }
 
     fn hasChildren(self: *Mem, dir: []const u8) bool {
@@ -168,6 +172,7 @@ pub const Mem = struct {
         if (node.bytes.len != 0) self.allocator.free(node.bytes);
         node.bytes = copy;
         node.modified_ms += 1;
+        self.generation += 1;
     }
 
     fn writeFile(ptr: *anyopaque, path: []const u8, bytes: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
@@ -209,6 +214,7 @@ pub const Mem = struct {
             try self.nodes.put(self.allocator, new_key, kv.value);
             self.allocator.free(kv.key);
         }
+        self.generation += 1;
     }
 
     fn rename(ptr: *anyopaque, path: []const u8, new_path: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
@@ -223,6 +229,7 @@ pub const Mem = struct {
         const kv = self.nodes.fetchOrderedRemove(path).?;
         self.allocator.free(kv.key);
         if (kv.value.bytes.len != 0) self.allocator.free(kv.value.bytes);
+        self.generation += 1;
     }
 
     fn remove(ptr: *anyopaque, path: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {

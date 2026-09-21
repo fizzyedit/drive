@@ -27,10 +27,12 @@ pub const path = struct {
 pub const http = @import("http.zig");
 pub const Mem = @import("mem.zig").Mem;
 pub const drive = @import("drive.zig");
+pub const zip = @import("zip.zig");
 
 test {
     _ = @import("Fs.zig");
     _ = @import("http.zig");
     _ = @import("mem.zig");
     _ = @import("drive.zig");
+    _ = @import("zip.zig");
 }
