@@ -447,7 +447,7 @@ fn pollLoopback(st: *State) void {
 
 fn openPicker(st: *State) void {
     if (st.phase != .mounted) return;
-    if (api_key.len == 0) return complain("This build of the Drive plugin has no API key, which Google's folder picker needs.");
+    if (api_key.len == 0) return complain("Google's folder picker needs an API key: add .api_key to credentials.zon (README › Publisher setup, step 5) and rebuild the plugin.");
     const gpa = sdk.allocator();
     if (st.picker_state.len == 0) {
         var nonce: [24]u8 = undefined;
