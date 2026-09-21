@@ -560,35 +560,26 @@ fn drawRailItem(_: ?*anyopaque, size: f32) anyerror!void {
     const lit = theme.color(.window, .text);
     const disc_color = if (signed_in) theme.color(.highlight, .fill) else if (bw.hovered()) lit else rest;
 
-    // The disc: a round box the size of an icon. Signed in with a picture, the picture fills
-    // it; otherwise it is a ring around a smaller user glyph.
-    var disc = dvui.box(@src(), .{ .dir = .vertical }, .{
-        .min_size_content = .{ .w = size, .h = size },
-        .max_size_content = .{ .w = size, .h = size },
-        .corners = .all(1000),
-        .background = true,
-        .color_fill = .{ .color = if (signed_in and st.avatar != null) .transparent else rest.opacity(0.35) },
-        .border = dvui.Rect.all(1),
-        .color_border = .{ .color = disc_color },
-        .padding = dvui.Rect.all(0),
-        .margin = dvui.Rect.all(0),
-        .gravity_x = 0.5,
-        .gravity_y = 0.5,
-    });
-    defer disc.deinit();
-
-    if (signed_in and st.avatar != null) {
-        _ = dvui.image(@src(), .{ .source = st.avatar.?, .shrink = .ratio }, .{
-            .min_size_content = .{ .w = size, .h = size },
-            .max_size_content = .{ .w = size, .h = size },
-            .corners = .all(1000),
-            .gravity_x = 0.5,
-            .gravity_y = 0.5,
-            .padding = dvui.Rect.all(0),
-            .margin = dvui.Rect.all(0),
-        });
+    // The disc, drawn by hand: a true circle the size of an icon, centred in the cell. A box
+    // with rounded corners clamps its radius and comes out a rounded rect. Signed in with a
+    // picture, the picture fills the circle; otherwise a faint disc with a user glyph in it.
+    const rs = bw.data().contentRectScale();
+    const side = size * rs.s;
+    const cx = rs.r.x + rs.r.w / 2;
+    const cy = rs.r.y + rs.r.h / 2;
+    const square: dvui.RectScale = .{ .r = .{ .x = cx - side / 2, .y = cy - side / 2, .w = side, .h = side }, .s = rs.s };
+    if (signed_in and st.avatar != null) blk: {
+        const tex = st.avatar.?.getTexture() catch break :blk;
+        dvui.renderTexture(tex, square, .{ .corners = .all(side / 2) }) catch {};
     } else {
-        const glyph = size * 0.6;
+        var path: dvui.Path.Builder = .init(dvui.currentWindow().arena());
+        path.addArc(.{ .x = cx, .y = cy }, side / 2, 0, std.math.tau, false);
+        const circle = path.build();
+        circle.fillConvex(.{ .color = .{ .color = rest.opacity(0.35) }, .fade = 1.0 });
+        circle.stroke(.{ .thickness = 1.0 * rs.s, .color = .{ .color = disc_color }, .closed = true });
+    }
+    if (!(signed_in and st.avatar != null)) {
+        const glyph = size * 0.55;
         core.icon.icon(@src(), "drive-account", dvui.entypo.user, .{ .fill_color = .{ .color = disc_color }, .stroke_color = .{ .color = disc_color } }, .{
             .min_size_content = .{ .w = glyph, .h = glyph },
             .gravity_x = 0.5,
@@ -596,6 +587,9 @@ fn drawRailItem(_: ?*anyopaque, size: f32) anyerror!void {
             .padding = dvui.Rect.all(0),
             .margin = dvui.Rect.all(0),
         });
+    } else {
+        // Keep the cell the icon's size when nothing else is laid out in it.
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = size, .h = size }, .gravity_x = 0.5, .gravity_y = 0.5 });
     }
 
     if (bw.clicked()) menu_open = !menu_open;
