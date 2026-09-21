@@ -83,6 +83,9 @@ const State = struct {
     /// The `changes.list` poll: when it last ran, and whether one is in flight.
     last_poll_ms: i64 = 0,
     poll: ?vfs.Job = null,
+    /// The account's profile picture, once fetched. Owned pixels (freed with the source).
+    avatar: ?dvui.ImageSource = null,
+    avatar_job: ?vfs.http.Job = null,
 
     const Phase = enum {
         signed_out,
@@ -114,11 +117,23 @@ pub fn register(host: *sdk.Host) !void {
         .isEnabled = cmdSignInEnabled,
     });
     try host.registerCommand(.{
+        .id = sdk.Plugin.commandId(plugin_id, "open"),
+        .owner = &plugin,
+        .title = "Open Google Drive",
+        .run = cmdOpen,
+        .isEnabled = cmdOpenEnabled,
+    });
+    try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "sign_out"),
         .owner = &plugin,
         .title = "Disconnect Google Drive",
         .run = cmdSignOut,
         .isEnabled = cmdSignOutEnabled,
+    });
+    try host.registerRailItem(.{
+        .id = "drive.rail.account",
+        .owner = &plugin,
+        .draw = drawRailItem,
     });
     try host.registerMenuSection(.{
         .id = "drive.menu.file_section",
@@ -225,6 +240,27 @@ fn cmdSignOut(ptr: *anyopaque) anyerror!void {
 fn cmdSignOutEnabled(ptr: *anyopaque) bool {
     return stateOf(ptr).phase != .signed_out;
 }
+fn cmdOpen(ptr: *anyopaque) anyerror!void {
+    openAsRoot(stateOf(ptr));
+}
+fn cmdOpenEnabled(ptr: *anyopaque) bool {
+    const st = stateOf(ptr);
+    return st.phase == .mounted and !rootIsDrive(st);
+}
+
+/// Whether the open folder is this drive.
+fn rootIsDrive(st: *State) bool {
+    const f = sdk.host().folder() orelse return false;
+    return st.prefix.len != 0 and std.mem.startsWith(u8, f, st.prefix) and (f.len == st.prefix.len or f[st.prefix.len] == '/');
+}
+
+/// Make the (already mounted) drive the open root again — after the user closed it, or
+/// opened something else.
+fn openAsRoot(st: *State) void {
+    if (st.phase != .mounted) return;
+    sdk.host().setProjectFolder(st.prefix) catch |err| dvui.log.warn("drive: could not open {s}: {t}", .{ st.prefix, err });
+}
+
 fn nativeSignIn(_: ?*anyopaque) anyerror!void {
     signIn(stateOf(plugin.state));
 }
@@ -238,6 +274,9 @@ fn drawFileMenuSection(_: ?*anyopaque) anyerror!void {
         if (host.drawMenuItem("Connect Google Drive… (retry)", sdk.Plugin.commandId(plugin_id, "sign_in"))) signIn(st);
         if (host.drawMenuItem("Cancel Google sign-in", sdk.Plugin.commandId(plugin_id, "sign_out"))) signOut(st, false);
     } else {
+        if (st.phase == .mounted and !rootIsDrive(st)) {
+            if (host.drawMenuItem("Open Google Drive", sdk.Plugin.commandId(plugin_id, "open"))) openAsRoot(st);
+        }
         const label = std.fmt.allocPrint(host.arena(), "Disconnect Google Drive ({s})", .{
             if (st.account.len != 0) st.account else "signing in…",
         }) catch "Disconnect Google Drive";
@@ -438,7 +477,118 @@ fn onAbout(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
         dvui.log.err("drive: mount failed: {t}", .{err});
         return fail(st, "could not mount the drive");
     };
+    if (parsed.value.user.photoLink) |link| fetchAvatar(st, link);
 }
+
+/// The profile picture is decoration: fetched after the mount is up, dropped on any failure
+/// (the web build's `fetch` cannot read it cross-origin, for one), and the disc shows a
+/// glyph until it lands.
+fn fetchAvatar(st: *State, link: []const u8) void {
+    if (st.avatar_job != null) return;
+    const gpa = sdk.allocator();
+    // A larger rendition than Google's default 64 px, sharp on a 2× rail.
+    const url = std.fmt.allocPrint(gpa, "{s}{s}", .{ link, if (std.mem.indexOf(u8, link, "=s") != null) "" else "=s128" }) catch return;
+    defer gpa.free(url);
+    st.avatar_job = st.transport.request(gpa, .{ .method = .GET, .url = url }, onAvatar, st) catch null;
+}
+
+fn onAvatar(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
+    const st: *State = @ptrCast(@alignCast(ctx.?));
+    st.avatar_job = null;
+    const gpa = sdk.allocator();
+    const resp = result catch return;
+    defer resp.deinit(gpa);
+    if (resp.status != 200) return;
+    dropAvatar(st);
+    st.avatar = core.image.fromImageFileBytesAlloc(gpa, "drive-avatar", resp.body, .ptr) catch null;
+    sdk.refresh();
+}
+
+fn dropAvatar(st: *State) void {
+    if (st.avatar) |src| {
+        if (src == .pixelsPMA) sdk.allocator().free(src.pixelsPMA.rgba);
+    }
+    st.avatar = null;
+}
+
+// ---- the rail disc ----------------------------------------------------------------------------
+
+/// The account at the bottom of the rail: the profile picture in a disc (a user glyph while
+/// signed out or until the picture arrives). Click for the menu: sign in, open the drive,
+/// sign out.
+fn drawRailItem(_: ?*anyopaque, size: f32) anyerror!void {
+    const st = stateOf(plugin.state);
+    const theme = dvui.themeGet();
+
+    var bw: dvui.ButtonWidget = undefined;
+    bw.init(@src(), .{}, .{ .min_size_content = .{ .w = size, .h = size }, .background = false, .padding = dvui.Rect.all(0), .margin = dvui.Rect.all(0) });
+    defer bw.deinit();
+    bw.processEvents();
+    bw.drawBackground();
+
+    const signed_in = st.phase == .mounted;
+    if (signed_in and st.avatar != null) {
+        _ = dvui.image(@src(), .{ .source = st.avatar.?, .shrink = .ratio }, .{
+            .min_size_content = .{ .w = size, .h = size },
+            .max_size_content = .{ .w = size, .h = size },
+            .corners = .all(1000),
+            .gravity_x = 0.5,
+            .gravity_y = 0.5,
+        });
+    } else {
+        const color = if (signed_in) theme.color(.highlight, .fill) else if (bw.hovered()) theme.color(.window, .text) else theme.color(.window, .fill);
+        core.icon.icon(@src(), "drive-account", dvui.entypo.user, .{ .fill_color = .{ .color = color }, .stroke_color = .{ .color = color } }, .{
+            .min_size_content = .{ .h = size },
+            .gravity_x = 0.5,
+            .gravity_y = 0.5,
+        });
+    }
+
+    if (bw.clicked()) menu_open = !menu_open;
+    if (!menu_open) return;
+
+    const anchor = bw.data().borderRectScale().r;
+    var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(.{ .x = anchor.x + anchor.w, .y = anchor.y }) }, .{});
+    defer fw.deinit();
+    const host = sdk.host();
+    const arena = host.arena();
+    switch (st.phase) {
+        .signed_out => {
+            if (dvui.menuItemLabel(@src(), "Connect Google Drive…", .{}, .{ .expand = .horizontal }) != null) {
+                menu_open = false;
+                signIn(st);
+            }
+        },
+        .mounted => {
+            const who = std.fmt.allocPrint(arena, "{s}", .{st.account}) catch "Google Drive";
+            dvui.labelNoFmt(@src(), who, .{}, .{ .color_text = .{ .color = theme.color(.control, .text) } });
+            _ = dvui.separator(@src(), .{ .expand = .horizontal });
+            if (!rootIsDrive(st)) {
+                if (dvui.menuItemLabel(@src(), "Open Google Drive", .{}, .{ .expand = .horizontal }) != null) {
+                    menu_open = false;
+                    openAsRoot(st);
+                }
+            }
+            if (dvui.menuItemLabel(@src(), "Sign out", .{}, .{ .expand = .horizontal }) != null) {
+                menu_open = false;
+                signOut(st, true);
+            }
+        },
+        else => {
+            dvui.labelNoFmt(@src(), "Signing in…", .{}, .{ .color_text = .{ .color = theme.color(.control, .text) } });
+            if (dvui.menuItemLabel(@src(), "Cancel", .{}, .{ .expand = .horizontal }) != null) {
+                menu_open = false;
+                signOut(st, false);
+            }
+        },
+    }
+    // Any click elsewhere closes it, like a menu.
+    for (dvui.events()) |*e| {
+        if (e.evt == .mouse and e.evt.mouse.action == .press and !fw.data().borderRectScale().r.contains(e.evt.mouse.p)) menu_open = false;
+    }
+}
+
+var menu_open: bool = false;
 
 fn mountDrive(st: *State, email: []const u8) !void {
     const gpa = sdk.allocator();
@@ -458,6 +608,9 @@ fn mountDrive(st: *State, email: []const u8) !void {
     st.client = client;
     st.phase = .mounted;
     setSetting(st, "account", email);
+    // The drive becomes the open root, replacing whatever was — there is one root, and it
+    // closes like any other (Close on its row, File › Close Folder, or Disconnect).
+    sdk.host().setProjectFolder(prefix) catch |err| dvui.log.warn("drive: could not open {s} as the folder: {t}", .{ prefix, err });
     const msg = std.fmt.allocPrint(sdk.host().arena(), "Google Drive connected as {s}.", .{email}) catch "Google Drive connected.";
     dvui.toast(@src(), .{ .message = msg });
     sdk.refresh();
@@ -520,6 +673,11 @@ fn signOut(st: *State, forget: bool) void {
     st.account = &.{};
     if (st.web_state.len != 0) gpa.free(st.web_state);
     st.web_state = &.{};
+    if (st.avatar_job) |job| {
+        st.transport.cancel(job);
+        st.avatar_job = null;
+    }
+    dropAvatar(st);
     if (is_wasm) core.transport.WebOAuth.cancel();
     st.phase = .signed_out;
     if (forget) {

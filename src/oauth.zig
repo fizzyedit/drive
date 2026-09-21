@@ -13,7 +13,7 @@ pub const scope_file = "https://www.googleapis.com/auth/drive.file";
 pub const scope_full = "https://www.googleapis.com/auth/drive";
 pub const auth_endpoint = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const token_endpoint = "https://oauth2.googleapis.com/token";
-pub const about_endpoint = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)";
+pub const about_endpoint = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName,photoLink)";
 
 /// A PKCE verifier and its S256 challenge, plus a `state` nonce the redirect must echo.
 pub const Pkce = struct {
@@ -129,6 +129,7 @@ pub const About = struct {
     user: struct {
         emailAddress: []const u8 = "",
         displayName: []const u8 = "",
+        photoLink: ?[]const u8 = null,
     } = .{},
 };
 
