@@ -69,9 +69,11 @@ const Scripted = struct {
 
     fn pump(ptr: *anyopaque) void {
         const self: *Scripted = @ptrCast(@alignCast(ptr));
-        var taken = self.completions.take();
-        defer taken.deinit(self.allocator);
-        for (taken.items) |item| item.payload.cb(item.payload.ctx, .{ .status = item.payload.status, .body = item.payload.body });
+        self.completions.drain({}, struct {
+            fn f(_: void, p: Pending) void {
+                p.cb(p.ctx, .{ .status = p.status, .body = p.body });
+            }
+        }.f);
     }
 
     /// The nth request's URL, or "" — so a test can assert on order.
@@ -162,6 +164,9 @@ const little_drive = [_]Scripted.Route{
         \\{"id":"a1","name":"renamed.txt","mimeType":"text/plain","size":"7"}
     },
     .{ .contains = "?fields=id", .method = .PATCH, .body = "{\"id\":\"x\"}" },
+    .{ .contains = "files/a1?fields=", .method = .PATCH, .body =
+        \\{"id":"a1","name":"b.txt","mimeType":"text/plain","size":"7"}
+    },
 };
 
 const Harness = struct {
@@ -323,6 +328,29 @@ test "remove trashes; a non-empty directory is refused after listing it" {
     _ = try h.fs().stat("/top.txt", Sink.onStat, &h.sink);
     try settle(h.fs(), &h.sink);
     try std.testing.expectEqual(Fs.Error.NotFound, h.sink.err.?);
+}
+
+test "an ancestor forgotten while a listing is in flight fails that listing, not the process" {
+    const h = try Harness.init(std.testing.allocator, &little_drive);
+    defer h.deinit();
+    // Page 1 of the root arrives; before page 2, something re-lists the root (a mutation's
+    // invalidateAll) which drops what the first listing indexed.
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    h.fs().pump(); // page 1 answered, page 2 in flight
+    h.client.forget("/");
+    try settle(h.fs(), &h.sink);
+    try std.testing.expect(h.sink.err != null or h.sink.entries != null);
+}
+
+test "a rename within one folder does not move parents" {
+    const h = try Harness.init(std.testing.allocator, &little_drive);
+    defer h.deinit();
+    _ = try h.fs().rename("/notes/a.txt", "/notes/b.txt", Sink.onDone, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expect(h.sink.err == null);
+    const last = h.scripted.log.items[h.scripted.log.items.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, last.url, "addParents") == null);
+    try std.testing.expect(std.mem.indexOf(u8, last.body, "\"name\":\"b.txt\"") != null);
 }
 
 test "duplicate sibling names: first listed wins" {

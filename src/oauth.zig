@@ -223,34 +223,44 @@ pub const Loopback = if (builtin.target.cpu.arch == .wasm32) struct {} else stru
 
     fn serve(self: *Self) void {
         defer self.done.store(true, .release);
-        const stream = self.server.accept(self.io) catch {
-            self.setResult(null, true);
+        // Loop until a request that carries our `state` arrives: a browser opens speculative
+        // idle connections (and favicon requests) that would otherwise consume the one accept
+        // and leave the real redirect with nobody listening.
+        while (true) {
+            const stream = self.server.accept(self.io) catch {
+                self.setResult(null, true);
+                return;
+            };
+            defer stream.close(self.io);
+            if (self.stopping.load(.acquire)) return;
+            var in_buf: [8192]u8 = undefined;
+            var out_buf: [1024]u8 = undefined;
+            var reader = stream.reader(self.io, &in_buf);
+            var writer = stream.writer(self.io, &out_buf);
+            var server = std.http.Server.init(&reader.interface, &writer.interface);
+            var req = server.receiveHead() catch continue; // an idle connection that closed
+            const target = req.head.target;
+            const query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
+            const state = queryParam(query, "state") orelse {
+                req.respond("", .{ .status = .not_found, .keep_alive = false }) catch {};
+                continue;
+            };
+            if (!std.mem.eql(u8, state, &self.expected_state)) {
+                req.respond(page_err, .{ .keep_alive = false, .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }} }) catch {};
+                self.setResult(null, true);
+                return;
+            }
+            const ok = blk: {
+                const raw = queryParam(query, "code") orelse break :blk false;
+                const code = decode(self.gpa, raw) catch break :blk false;
+                self.setResult(code, false);
+                break :blk true;
+            };
+            if (!ok) self.setResult(null, true);
+            const page = if (ok) page_ok else page_err;
+            req.respond(page, .{ .keep_alive = false, .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }} }) catch {};
             return;
-        };
-        defer stream.close(self.io);
-        if (self.stopping.load(.acquire)) return;
-        var in_buf: [8192]u8 = undefined;
-        var out_buf: [1024]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-        var server = std.http.Server.init(&reader.interface, &writer.interface);
-        var req = server.receiveHead() catch {
-            self.setResult(null, true);
-            return;
-        };
-        const target = req.head.target;
-        const query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
-        const ok = blk: {
-            const state = queryParam(query, "state") orelse break :blk false;
-            if (!std.mem.eql(u8, state, &self.expected_state)) break :blk false;
-            const raw = queryParam(query, "code") orelse break :blk false;
-            const code = decode(self.gpa, raw) catch break :blk false;
-            self.setResult(code, false);
-            break :blk true;
-        };
-        if (!ok) self.setResult(null, true);
-        const page = if (ok) page_ok else page_err;
-        req.respond(page, .{ .keep_alive = false, .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }} }) catch {};
+        }
     }
 
     fn setResult(self: *Self, code: ?[]u8, failed: bool) void {
@@ -372,6 +382,46 @@ test "stopping a listener nobody ever connected to is clean" {
     const pkce = Pkce.generate(io);
     const lb = try Loopback.start(std.testing.allocator, io, pkce.state);
     lb.stop();
+}
+
+test "an idle connection before the redirect does not consume the listener" {
+    if (builtin.target.cpu.arch == .wasm32) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const pkce = Pkce.generate(io);
+    const lb = try Loopback.start(a, io, pkce.state);
+    defer lb.stop();
+    // A speculative connection that says nothing and goes away, then a favicon request.
+    const idle = try lb.server.socket.address.connect(io, .{ .mode = .stream });
+    idle.close(io);
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    const fav = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/favicon.ico", .{lb.port()});
+    defer a.free(fav);
+    var sink: std.Io.Writer.Allocating = .init(a);
+    defer sink.deinit();
+    const r = try client.fetch(.{ .location = .{ .url = fav }, .response_writer = &sink.writer });
+    try std.testing.expectEqual(std.http.Status.not_found, r.status);
+    try std.testing.expectEqual(Loopback.Outcome.waiting, lb.take());
+    // The real redirect still lands.
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/?state={s}&code=abc", .{ lb.port(), &pkce.state });
+    defer a.free(url);
+    var page: std.Io.Writer.Allocating = .init(a);
+    defer page.deinit();
+    _ = try client.fetch(.{ .location = .{ .url = url }, .response_writer = &page.writer });
+    var spins: usize = 0;
+    while (spins < 5000) : (spins += 1) {
+        switch (lb.take()) {
+            .code => |c| {
+                defer a.free(c);
+                try std.testing.expectEqualStrings("abc", c);
+                return;
+            },
+            .failed => return error.LoopbackFailed,
+            .waiting => std.Io.sleep(io, .fromMicroseconds(1000), .awake) catch {},
+        }
+    }
+    return error.NoCode;
 }
 
 test "a redirect with the wrong state is refused" {

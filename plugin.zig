@@ -333,8 +333,13 @@ fn onToken(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
     defer parsed.deinit();
     if (resp.status != 200 or parsed.value.access_token.len == 0) {
         dvui.log.err("drive: token request: HTTP {d} {s}: {s}", .{ resp.status, parsed.value.@"error" orelse "", parsed.value.error_description orelse "" });
-        // A refresh token Google no longer honours is not worth keeping.
-        if (resp.status == 400 or resp.status == 401) setSetting(st, "refresh_token", "");
+        if (resp.status == 400 or resp.status == 401) {
+            // A refresh token Google no longer honours is not worth keeping, and a mount it
+            // can no longer refresh is not worth keeping up.
+            setSetting(st, "refresh_token", "");
+            signOut(st, false);
+            return complain("Google Drive: the saved sign-in is no longer valid; connect again.");
+        }
         return fail(st, "Google refused the sign-in");
     }
     setToken(st, parsed.value.access_token, parsed.value.expires_in);
@@ -449,9 +454,14 @@ fn signOut(st: *State, forget: bool) void {
 fn fail(st: *State, what: []const u8) void {
     const msg = std.fmt.allocPrint(sdk.host().arena(), "Google Drive: {s}.", .{what}) catch "Google Drive: sign-in failed.";
     complain(msg);
-    // A refresh that fails while mounted leaves the mount up with its old token; the next
-    // request's 401 is the truth then. Anything earlier in the flow starts over.
-    if (st.phase != .mounted) signOut(st, false);
+    // A refresh that fails while mounted (the network, a 5xx) leaves the mount up with its old
+    // token and is retried in a minute — not next frame, which was one token POST per frame.
+    // Anything earlier in the flow starts over.
+    if (st.phase == .mounted) {
+        st.expires_at_ms = nowMs() + 120_000 + 60_000;
+        return;
+    }
+    signOut(st, false);
 }
 
 fn complain(msg: []const u8) void {

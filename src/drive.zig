@@ -60,6 +60,9 @@ pub const Client = struct {
     index: std.StringHashMapUnmanaged(Node) = .empty,
     jobs: std.AutoArrayHashMapUnmanaged(u64, *Job) = .empty,
     ready: http.Completions(*Job),
+    /// The job whose callback `pump` is inside, so a cancel of it from that callback is a
+    /// no-op rather than a use-after-free.
+    delivering: ?*Job = null,
     initialised: bool = false,
 
     pub fn init(allocator: Allocator, transport: http.Transport, access_token: []const u8, root_id: []const u8) Allocator.Error!Client {
@@ -200,22 +203,30 @@ pub const Client = struct {
     fn cancel(ptr: *anyopaque, handle: Fs.Job) void {
         const self: *Client = @ptrCast(@alignCast(ptr));
         const job = self.jobs.get(handle.id) orelse return;
+        // Its own callback is running right now: `pump` destroys it once that returns.
+        if (self.delivering == job) return;
         _ = self.jobs.swapRemove(handle.id);
-        _ = self.ready.remove(handle.id);
+        if (job.phase == .done) {
+            // Queued for delivery. `remove` hands it back (or, if a callback earlier in the
+            // same batch is what cancelled it, marks it skipped) — either way `pump` will not
+            // touch it again, so it is ours to destroy.
+            _ = self.ready.remove(handle.id);
+        }
         job.destroy();
     }
 
     fn pump(ptr: *anyopaque) void {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.transport.pump();
-        var taken = self.ready.take();
-        defer taken.deinit(self.allocator);
-        for (taken.items) |item| {
-            const job = item.payload;
-            _ = self.jobs.swapRemove(job.id);
-            job.deliver();
-            job.destroy();
-        }
+        self.ready.drain(self, deliverOne);
+    }
+
+    fn deliverOne(self: *Client, job: *Job) void {
+        _ = self.jobs.swapRemove(job.id);
+        self.delivering = job;
+        job.deliver();
+        self.delivering = null;
+        job.destroy();
     }
 
     // -- HTTP ------------------------------------------------------------------------------
@@ -418,7 +429,7 @@ const Job = struct {
     fn resolved(job: *Job) Fs.Error!void {
         const client = job.client;
         const a = client.allocator;
-        const node = client.index.getPtr(job.resolving).?;
+        const node = client.index.getPtr(job.resolving) orelse return error.NotFound;
         switch (job.op) {
             .list => {
                 if (node.kind != .dir) return error.NotADirectory;
@@ -466,13 +477,15 @@ const Job = struct {
                 if (node.kind != .dir) return error.NotADirectory;
                 if (!node.listed) return job.beginListing(job.resolving);
                 if (client.index.contains(job.path2)) return error.Exists;
-                const src = client.index.getPtr(job.path).?;
-                const old_parent = client.index.getPtr(Fs.path.dirname(job.path)).?;
+                const src = client.index.getPtr(job.path) orelse return error.NotFound;
+                const old_parent = client.index.getPtr(Fs.path.dirname(job.path)) orelse return error.NotFound;
                 const meta = try std.json.Stringify.valueAlloc(a, .{ .name = Fs.path.basename(job.path2) }, .{});
                 errdefer a.free(meta);
-                const url = try std.fmt.allocPrint(a, "{s}/{s}?addParents={s}&removeParents={s}&fields={s}", .{
-                    api, src.id, node.id, old_parent.id, file_fields,
-                });
+                // A plain rename keeps its parent; Google rejects add == remove.
+                const url = if (std.mem.eql(u8, node.id, old_parent.id))
+                    try std.fmt.allocPrint(a, "{s}/{s}?fields={s}", .{ api, src.id, file_fields })
+                else
+                    try std.fmt.allocPrint(a, "{s}/{s}?addParents={s}&removeParents={s}&fields={s}", .{ api, src.id, node.id, old_parent.id, file_fields });
                 job.phase = .request;
                 try client.send(job, .PATCH, url, "application/json", meta, meta);
             },
@@ -501,7 +514,8 @@ const Job = struct {
 
     fn requestPage(job: *Job) Fs.Error!void {
         const client = job.client;
-        const dir_node = client.index.get(job.listing).?;
+        // Another op may have forgotten this directory while a page was in flight.
+        const dir_node = client.index.get(job.listing) orelse return error.NotFound;
         const url = try buildListUrl(client.allocator, dir_node.id, job.page_token);
         try client.send(job, .GET, url, null, &.{}, null);
     }
@@ -566,7 +580,7 @@ const Job = struct {
             }
         }
 
-        client.index.getPtr(job.listing).?.listed = true;
+        (client.index.getPtr(job.listing) orelse return error.NotFound).listed = true;
         if (for_caller) return job.completeListing();
         // An ancestor listing on the way to something else: keep resolving.
         job.phase = .resolve;
@@ -600,9 +614,10 @@ const Job = struct {
             .write => {
                 if (parseFile(a, body)) |file| {
                     defer file.deinit();
-                    const node = client.index.getPtr(job.path).?;
-                    node.size = parseSize(file.value.size);
-                    node.modified_ms = parseRfc3339Ms(file.value.modifiedTime);
+                    if (client.index.getPtr(job.path)) |node| {
+                        node.size = parseSize(file.value.size);
+                        node.modified_ms = parseRfc3339Ms(file.value.modifiedTime);
+                    }
                 } else |_| {}
                 job.complete(.ok);
             },
