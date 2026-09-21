@@ -15,6 +15,7 @@ client_id: settings.Value([]const u8, .{
 client_secret: settings.Value([]const u8, .{
     .name = "OAuth client secret (desktop)",
     .description = "The desktop client's secret, which Google requires at the token exchange.",
+    .secret = true,
 }) = .init(""),
 
 web_client_id: settings.Value([]const u8, .{
@@ -39,6 +40,7 @@ root_folder_id: settings.Value([]const u8, .{
 refresh_token: settings.Value([]const u8, .{
     .name = "Refresh token",
     .description = "Written by Sign In (desktop only). Clear it to sign out for good.",
+    .secret = true,
 }) = .init(""),
 
 account: settings.Value([]const u8, .{
