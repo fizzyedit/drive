@@ -605,10 +605,17 @@ const Job = struct {
         defer resp.deinit(job.client.allocator);
         switch (resp.status) {
             200...299 => {},
-            401 => return error.Unauthorized,
-            403 => return error.Forbidden,
-            404 => return error.NotFound,
-            else => return error.Http,
+            else => {
+                // Drive's error bodies say why (scope, disabled API, a wrong id); a bare
+                // error code would not.
+                std.log.warn("drive: {s} → HTTP {d}: {s}", .{ job.url, resp.status, resp.body[0..@min(resp.body.len, 400)] });
+                return switch (resp.status) {
+                    401 => error.Unauthorized,
+                    403 => error.Forbidden,
+                    404 => error.NotFound,
+                    else => error.Http,
+                };
+            },
         }
         switch (job.phase) {
             .list_page => try job.onListPage(resp.body),
