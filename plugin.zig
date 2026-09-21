@@ -138,10 +138,12 @@ pub fn register(host: *sdk.Host) !void {
         .run = cmdSignOut,
         .isEnabled = cmdSignOutEnabled,
     });
-    try host.registerRailItem(.{
-        .id = "drive.rail.account",
+    try host.registerAccountProvider(.{
+        .id = "drive.google",
+        .name = "Google Drive",
         .owner = &plugin,
-        .draw = drawRailItem,
+        .ctx = st,
+        .vtable = &account_vtable,
     });
     try host.registerMenuSection(.{
         .id = "drive.menu.file_section",
@@ -538,109 +540,48 @@ fn dropAvatar(st: *State) void {
     st.avatar = null;
 }
 
-// ---- the rail disc ----------------------------------------------------------------------------
+// ---- the account, as the host's rail disc shows it ----------------------------------------
 
-/// The account at the bottom of the rail: the profile picture in a disc (a user glyph while
-/// signed out or until the picture arrives). Click for the menu: sign in, open the drive,
-/// sign out.
-fn drawRailItem(_: ?*anyopaque, size: f32) anyerror!void {
-    const st = stateOf(plugin.state);
-    const theme = dvui.themeGet();
+const account_vtable: sdk.accounts.Provider.VTable = .{
+    .accounts = providerAccounts,
+    .signIn = providerSignIn,
+    .menu = providerMenu,
+};
 
-    // The same cell as the rail's own icons (`Sidebar.drawOption`): a button the icon's
-    // height, the glyph centred in it.
-    var bw: dvui.ButtonWidget = undefined;
-    bw.init(@src(), .{}, .{ .min_size_content = .{ .h = size } });
-    defer bw.deinit();
-    bw.processEvents();
-    bw.drawBackground();
-
-    const signed_in = st.phase == .mounted;
-    const rest = theme.color(.window, .fill);
-    const lit = theme.color(.window, .text);
-    const disc_color = if (signed_in) theme.color(.highlight, .fill) else if (bw.hovered()) lit else rest;
-
-    // The disc, drawn by hand: a true circle the size of an icon, centred in the cell. A box
-    // with rounded corners clamps its radius and comes out a rounded rect. Signed in with a
-    // picture, the picture fills the circle; otherwise a faint disc with a user glyph in it.
-    const rs = bw.data().contentRectScale();
-    const side = size * rs.s;
-    const cx = rs.r.x + rs.r.w / 2;
-    const cy = rs.r.y + rs.r.h / 2;
-    const square: dvui.RectScale = .{ .r = .{ .x = cx - side / 2, .y = cy - side / 2, .w = side, .h = side }, .s = rs.s };
-    if (signed_in and st.avatar != null) blk: {
-        const tex = st.avatar.?.getTexture() catch break :blk;
-        dvui.renderTexture(tex, square, .{ .corners = .all(side / 2) }) catch {};
-    } else {
-        var path: dvui.Path.Builder = .init(dvui.currentWindow().arena());
-        path.addArc(.{ .x = cx, .y = cy }, side / 2, 0, std.math.tau, false);
-        const circle = path.build();
-        circle.fillConvex(.{ .color = .{ .color = rest.opacity(0.35) }, .fade = 1.0 });
-        circle.stroke(.{ .thickness = 1.0 * rs.s, .color = .{ .color = disc_color }, .closed = true });
-    }
-    if (!(signed_in and st.avatar != null)) {
-        const glyph = size * 0.55;
-        core.icon.icon(@src(), "drive-account", dvui.entypo.user, .{ .fill_color = .{ .color = disc_color }, .stroke_color = .{ .color = disc_color } }, .{
-            .min_size_content = .{ .w = glyph, .h = glyph },
-            .gravity_x = 0.5,
-            .gravity_y = 0.5,
-            .padding = dvui.Rect.all(0),
-            .margin = dvui.Rect.all(0),
-        });
-    } else {
-        // Keep the cell the icon's size when nothing else is laid out in it.
-        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = size, .h = size }, .gravity_x = 0.5, .gravity_y = 0.5 });
-    }
-
-    if (bw.clicked()) menu_open = !menu_open;
-    if (!menu_open) return;
-
-    const anchor = bw.data().borderRectScale().r;
-    var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(.{ .x = anchor.x + anchor.w, .y = anchor.y }) }, .{});
-    defer fw.deinit();
-    const host = sdk.host();
-    const arena = host.arena();
-    switch (st.phase) {
-        .signed_out => {
-            if (dvui.menuItemLabel(@src(), "Connect Google Drive…", .{}, .{ .expand = .horizontal }) != null) {
-                menu_open = false;
-                signIn(st);
-            }
-        },
-        .mounted => {
-            const who = std.fmt.allocPrint(arena, "{s}", .{st.account}) catch "Google Drive";
-            dvui.labelNoFmt(@src(), who, .{}, .{ .color_text = .{ .color = theme.color(.control, .text) } });
-            _ = dvui.separator(@src(), .{ .expand = .horizontal });
-            if (dvui.menuItemLabel(@src(), "Open Google Drive Folder…", .{}, .{ .expand = .horizontal }) != null) {
-                menu_open = false;
-                FolderChooser.open(st.prefix);
-            }
-            if (!rootIsDrive(st)) {
-                if (dvui.menuItemLabel(@src(), "Open Google Drive", .{}, .{ .expand = .horizontal }) != null) {
-                    menu_open = false;
-                    openAsRoot(st);
-                }
-            }
-            if (dvui.menuItemLabel(@src(), "Sign out", .{}, .{ .expand = .horizontal }) != null) {
-                menu_open = false;
-                signOut(st, true);
-            }
-        },
-        else => {
-            dvui.labelNoFmt(@src(), "Signing in…", .{}, .{ .color_text = .{ .color = theme.color(.control, .text) } });
-            if (dvui.menuItemLabel(@src(), "Cancel", .{}, .{ .expand = .horizontal }) != null) {
-                menu_open = false;
-                signOut(st, false);
-            }
-        },
-    }
-    // Any click elsewhere closes it, like a menu.
-    for (dvui.events()) |*e| {
-        if (e.evt == .mouse and e.evt.mouse.action == .press and !fw.data().borderRectScale().r.contains(e.evt.mouse.p)) menu_open = false;
-    }
+fn providerAccounts(ctx: ?*anyopaque, arena: std.mem.Allocator) []const sdk.accounts.Account {
+    const st: *State = @ptrCast(@alignCast(ctx.?));
+    if (st.phase != .mounted) return &.{};
+    const one = arena.alloc(sdk.accounts.Account, 1) catch return &.{};
+    one[0] = .{ .id = st.account, .label = st.account, .avatar = st.avatar };
+    return one;
 }
 
-var menu_open: bool = false;
+fn providerSignIn(ctx: ?*anyopaque) void {
+    const st: *State = @ptrCast(@alignCast(ctx.?));
+    if (st.phase == .signed_out) signIn(st);
+}
+
+/// The account's submenu rows. True when one was chosen.
+fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
+    const st: *State = @ptrCast(@alignCast(ctx.?));
+    const opts: dvui.Options = .{ .expand = .horizontal, .color_text = .{ .color = dvui.themeGet().color(.control, .text) } };
+    if (dvui.menuItemLabel(@src(), "Open Google Drive Folder…", .{}, opts) != null) {
+        FolderChooser.open(st.prefix);
+        return true;
+    }
+    if (!rootIsDrive(st)) {
+        if (dvui.menuItemLabel(@src(), "Open Google Drive", .{}, opts) != null) {
+            openAsRoot(st);
+            return true;
+        }
+    }
+    _ = dvui.separator(@src(), .{ .expand = .horizontal });
+    if (dvui.menuItemLabel(@src(), "Sign out", .{}, opts) != null) {
+        signOut(st, true);
+        return true;
+    }
+    return false;
+}
 
 fn mountDrive(st: *State, email: []const u8) !void {
     const gpa = sdk.allocator();
