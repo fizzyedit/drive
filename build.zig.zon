@@ -9,6 +9,7 @@
         "plugin.zig.zon",
         "credentials.zon",
         "src",
+        "web",
         "LICENSE",
         "README.md",
     },

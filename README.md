@@ -32,10 +32,11 @@ All of it happens in the [Google Cloud console](https://console.cloud.google.com
 
 **Select a project › New project** — name it `fizzy` (anything works; users never see it).
 
-### 2. Enable the Drive API
+### 2. Enable the Drive API and the Picker API
 
 **APIs & Services › Library** → search *Google Drive API* → **Enable**. Without this every
-call fails with "API not enabled".
+call fails with "API not enabled". Then the same for *Google Picker API*: the folder chooser
+(**Open Google Drive Folder…**) is Google's own picker.
 
 ### 3. The consent screen
 
@@ -47,7 +48,7 @@ console).
 - **Scopes** → *Add or remove scopes* → tick `https://www.googleapis.com/auth/drive`
   ("See, edit, create, and delete all of your Google Drive files"). The plugin always asks
   for the whole drive — with the narrower `drive.file` a fresh sign-in shows an empty drive
-  and the desktop has no picker to change that. It is a *restricted* scope: testers can use it
+  until every file has been picked one by one. It is a *restricted* scope: testers can use it
   as soon as it is added, and publishing to everyone later means Google's app verification.
 - **Test users** → add your own Google account(s). While the app's *Publishing status* is
   **Testing**, only listed accounts can sign in (max 100). When it is time for strangers to
@@ -68,21 +69,31 @@ a desktop app cannot keep a secret — Google's own docs say so. It is the *app'
 not any user's, and is safe to ship as a default; it does not grant access to anything by
 itself.
 
-### 5. Put the IDs in `credentials.zon`
+### 5. An API key, for the folder picker
+
+**Credentials › Create credentials › API key.** Google's Picker needs one beside the user's
+token. Under *Restrict key*: API restrictions → *Google Picker API* only. Leave the
+application (referrer) restriction off, or the desktop's `http://127.0.0.1:*` page cannot use
+it — the key grants nothing on its own.
+
+### 6. Put the IDs in `credentials.zon`
 
 ```sh
 cp credentials.zon.example credentials.zon   # gitignored
 ```
 
-Fill in `client_id`, `client_secret` (desktop) and `web_client_id`, then `zig build`. They are
-baked into the plugin; users never see them. CI does the same from the environment —
-`FIZZY_DRIVE_CLIENT_ID`, `FIZZY_DRIVE_CLIENT_SECRET`, `FIZZY_DRIVE_WEB_CLIENT_ID` — because
-`zig build` generates `credentials.zon` from those when the file is missing.
+Fill in `client_id`, `client_secret` (desktop), `web_client_id` and `api_key`, then
+`zig build`. They are baked into the plugin; users never see them. CI does the same from the
+environment — `FIZZY_DRIVE_CLIENT_ID`, `FIZZY_DRIVE_CLIENT_SECRET`, `FIZZY_DRIVE_WEB_CLIENT_ID`,
+`FIZZY_DRIVE_API_KEY` — because `zig build` generates `credentials.zon` from those when the
+file is missing.
 
 ## What users see
 
-The whole drive as a folder, `gdrive://<account>`. **Settings › Google Drive › Root folder
-id** narrows the mount to one folder (its id is in the folder's Drive URL).
+The whole drive as a folder, `gdrive://<account>`. **File › Open Google Drive Folder…** (also
+in the account menu at the bottom of the rail) opens Google's folder picker in the browser;
+the chosen folder — shared ones included — becomes the root, `gdrive://<account>/<folder>`.
+**Open Google Drive** goes back to the whole drive.
 
 ## How it works
 

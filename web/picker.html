@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fizzy — choose a Google Drive folder</title>
+<body style="font-family:system-ui;background:#1d2029;color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0">
+<div style="text-align:center"><p id="msg">Loading Google Drive…</p></div>
+<script>
+  // Google's own folder picker, run for fizzy. Everything it needs arrives in the fragment —
+  // which a server never sees — set by the plugin that opened this page:
+  //   token  the signed-in account's access token
+  //   key    the app's API key (Google requires one for the Picker)
+  //   state  a nonce the result must echo
+  //   mode   "web": post the result to the opener (the fizzy web app);
+  //          "loopback": navigate to it on this origin (the plugin's local listener).
+  const p = new URLSearchParams(location.hash.slice(1));
+  const token = p.get("token"), key = p.get("key"), state = p.get("state"), mode = p.get("mode");
+  const msg = document.getElementById("msg");
+
+  function deliver(query) {
+    if (mode === "web") {
+      if (window.opener) window.opener.postMessage({ fizzyOAuth: query }, location.origin);
+      window.close();
+      msg.textContent = "You can close this window and return to fizzy.";
+    } else {
+      location.href = "/" + query;
+    }
+  }
+  function folderView(id) {
+    return new google.picker.DocsView(id)
+      .setIncludeFolders(true)
+      .setSelectFolderEnabled(true)
+      .setMimeTypes("application/vnd.google-apps.folder");
+  }
+  function show() {
+    if (!token || !key) { msg.textContent = "The Drive plugin has no API key configured (README › Publisher setup)."; return; }
+    const picker = new google.picker.PickerBuilder()
+      .setOAuthToken(token)
+      .setDeveloperKey(key)
+      .setTitle("Open a Google Drive folder in fizzy")
+      .addView(folderView(google.picker.ViewId.FOLDERS))
+      .addView(folderView(google.picker.ViewId.DOCS).setOwnedByMe(false).setLabel("Shared with me"))
+      .addView(folderView(google.picker.ViewId.DOCS).setEnableDrives(true).setLabel("Shared drives"))
+      .setCallback((data) => {
+        if (data.action === google.picker.Action.PICKED) {
+          const doc = data.docs[0];
+          deliver("?state=" + encodeURIComponent(state) + "&id=" + encodeURIComponent(doc.id) + "&name=" + encodeURIComponent(doc.name));
+        } else if (data.action === google.picker.Action.CANCEL) {
+          deliver("?state=" + encodeURIComponent(state) + "&cancel=1");
+        }
+      })
+      .build();
+    msg.textContent = "";
+    picker.setVisible(true);
+  }
+  const s = document.createElement("script");
+  s.src = "https://apis.google.com/js/api.js";
+  s.onload = () => gapi.load("picker", show);
+  s.onerror = () => { msg.textContent = "Could not load Google's picker; check your connection."; };
+  document.head.appendChild(s);
+</script>

@@ -197,9 +197,14 @@ pub const Loopback = if (builtin.target.cpu.arch == .wasm32) struct {} else stru
     server: std.Io.net.Server,
     thread: ?std.Thread = null,
     expected_state: [32]u8,
+    /// What a GET with no `state` is answered with: a page for the browser to run (the
+    /// folder picker), or nothing (404 — a favicon probe during sign-in).
+    page: ?[]const u8,
+    /// What the redirect carrying `state` is answered with.
+    done_page: []const u8,
     lock: std.atomic.Mutex = .unlocked,
-    /// Set by the thread. Owned; taken by `take`.
-    code: ?[]u8 = null,
+    /// Set by the thread: the redirect's whole query string. Owned; taken by `take`.
+    query: ?[]u8 = null,
     failed: bool = false,
     done: std.atomic.Value(bool) = .init(false),
     /// Set by `stop` before it connects to wake the thread, so the thread knows that
@@ -208,11 +213,25 @@ pub const Loopback = if (builtin.target.cpu.arch == .wasm32) struct {} else stru
 
     const Self = @This();
 
-    pub fn start(gpa: std.mem.Allocator, io: std.Io, expected_state: [32]u8) !*Self {
+    pub const Options = struct {
+        /// Served at `/` (any request without `state`). Static: whatever the page needs to
+        /// know travels in the URL fragment fizzy opens, which never reaches this listener.
+        page: ?[]const u8 = null,
+        done_page: []const u8 = page_ok,
+    };
+
+    pub fn start(gpa: std.mem.Allocator, io: std.Io, expected_state: [32]u8, opts: Options) !*Self {
         const self = try gpa.create(Self);
         errdefer gpa.destroy(self);
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.* = .{ .gpa = gpa, .io = io, .server = try addr.listen(io, .{ .reuse_address = true }), .expected_state = expected_state };
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .server = try addr.listen(io, .{ .reuse_address = true }),
+            .expected_state = expected_state,
+            .page = opts.page,
+            .done_page = opts.done_page,
+        };
         errdefer self.server.deinit(io);
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
@@ -243,43 +262,48 @@ pub const Loopback = if (builtin.target.cpu.arch == .wasm32) struct {} else stru
             const target = req.head.target;
             const query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
             const state = queryParam(query, "state") orelse {
-                req.respond("", .{ .status = .not_found, .keep_alive = false }) catch {};
+                if (self.page) |page| {
+                    req.respond(page, .{ .keep_alive = false, .extra_headers = &html }) catch {};
+                } else {
+                    req.respond("", .{ .status = .not_found, .keep_alive = false }) catch {};
+                }
                 continue;
             };
             if (!std.mem.eql(u8, state, &self.expected_state)) {
-                req.respond(page_err, .{ .keep_alive = false, .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }} }) catch {};
+                req.respond(page_err, .{ .keep_alive = false, .extra_headers = &html }) catch {};
                 self.setResult(null, true);
                 return;
             }
-            const ok = blk: {
-                const raw = queryParam(query, "code") orelse break :blk false;
-                const code = decode(self.gpa, raw) catch break :blk false;
-                self.setResult(code, false);
-                break :blk true;
+            const owned = self.gpa.dupe(u8, query) catch {
+                req.respond(page_err, .{ .keep_alive = false, .extra_headers = &html }) catch {};
+                self.setResult(null, true);
+                return;
             };
-            if (!ok) self.setResult(null, true);
-            const page = if (ok) page_ok else page_err;
-            req.respond(page, .{ .keep_alive = false, .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }} }) catch {};
+            self.setResult(owned, false);
+            req.respond(self.done_page, .{ .keep_alive = false, .extra_headers = &html }) catch {};
             return;
         }
     }
 
-    fn setResult(self: *Self, code: ?[]u8, failed: bool) void {
+    const html = [_]std.http.Header{.{ .name = "content-type", .value = "text/html; charset=utf-8" }};
+
+    fn setResult(self: *Self, query: ?[]u8, failed: bool) void {
         while (!self.lock.tryLock()) std.Thread.yield() catch {};
         defer self.lock.unlock();
-        self.code = code;
+        self.query = query;
         self.failed = failed;
     }
 
-    pub const Outcome = union(enum) { waiting, code: []u8, failed };
+    pub const Outcome = union(enum) { waiting, query: []u8, failed };
 
-    /// Once: the code (owned by the caller from then on), failure, or still waiting.
+    /// Once: the redirect's query (owned by the caller from then on; `queryParam` + `decode`
+    /// read it), failure, or still waiting.
     pub fn take(self: *Self) Outcome {
         while (!self.lock.tryLock()) std.Thread.yield() catch {};
         defer self.lock.unlock();
-        if (self.code) |c| {
-            self.code = null;
-            return .{ .code = c };
+        if (self.query) |q| {
+            self.query = null;
+            return .{ .query = q };
         }
         if (self.failed) return .failed;
         return .waiting;
@@ -296,16 +320,16 @@ pub const Loopback = if (builtin.target.cpu.arch == .wasm32) struct {} else stru
         }
         if (self.thread) |t| t.join();
         self.server.deinit(self.io);
-        if (self.code) |c| self.gpa.free(c);
+        if (self.query) |q| self.gpa.free(q);
         self.gpa.destroy(self);
     }
 
-    const page_ok =
+    pub const page_ok =
         \\<!doctype html><meta charset="utf-8"><title>fizzy</title>
         \\<body style="font-family:system-ui;background:#1d2029;color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0">
         \\<div style="text-align:center"><h1>Signed in to Google Drive</h1><p>You can close this tab and return to fizzy.</p></div>
     ;
-    const page_err =
+    pub const page_err =
         \\<!doctype html><meta charset="utf-8"><title>fizzy</title>
         \\<body style="font-family:system-ui;background:#1d2029;color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0">
         \\<div style="text-align:center"><h1>Sign-in did not complete</h1><p>Return to fizzy and try again.</p></div>
@@ -350,7 +374,7 @@ test "the loopback listener takes the code from Google's redirect and answers th
     const a = std.testing.allocator;
     const io = std.testing.io;
     const pkce = Pkce.generate(io);
-    const lb = try Loopback.start(a, io, pkce.state);
+    const lb = try Loopback.start(a, io, pkce.state, .{});
     defer lb.stop();
     try std.testing.expectEqual(Loopback.Outcome.waiting, lb.take());
 
@@ -366,22 +390,66 @@ test "the loopback listener takes the code from Google's redirect and answers th
     try std.testing.expect(std.mem.indexOf(u8, page.written(), "Signed in") != null);
 
     var spins: usize = 0;
-    const code = while (spins < 5000) : (spins += 1) {
+    const query = while (spins < 5000) : (spins += 1) {
         switch (lb.take()) {
-            .code => |c| break c,
+            .query => |q| break q,
             .failed => return error.LoopbackFailed,
             .waiting => std.Io.sleep(io, .fromMicroseconds(1000), .awake) catch {},
         }
     } else return error.NoCode;
+    defer a.free(query);
+    const code = try decode(a, queryParam(query, "code").?);
     defer a.free(code);
     try std.testing.expectEqualStrings("4/0Ab-xyz", code);
+}
+
+test "a listener with a page serves it to a bare GET and still takes the redirect" {
+    if (builtin.target.cpu.arch == .wasm32) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const pkce = Pkce.generate(io);
+    const lb = try Loopback.start(a, io, pkce.state, .{ .page = "<p>pick</p>", .done_page = "<p>picked</p>" });
+    defer lb.stop();
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    const root = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/", .{lb.port()});
+    defer a.free(root);
+    var body: std.Io.Writer.Allocating = .init(a);
+    defer body.deinit();
+    const res = try client.fetch(.{ .location = .{ .url = root }, .response_writer = &body.writer });
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("<p>pick</p>", body.written());
+    try std.testing.expectEqual(Loopback.Outcome.waiting, lb.take());
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/?state={s}&id=f1&name=My%20Folder", .{ lb.port(), &pkce.state });
+    defer a.free(url);
+    var done: std.Io.Writer.Allocating = .init(a);
+    defer done.deinit();
+    _ = try client.fetch(.{ .location = .{ .url = url }, .response_writer = &done.writer });
+    try std.testing.expectEqualStrings("<p>picked</p>", done.written());
+    var spins: usize = 0;
+    while (spins < 5000) : (spins += 1) {
+        switch (lb.take()) {
+            .query => |q| {
+                defer a.free(q);
+                try std.testing.expectEqualStrings("f1", queryParam(q, "id").?);
+                const name = try decode(a, queryParam(q, "name").?);
+                defer a.free(name);
+                try std.testing.expectEqualStrings("My Folder", name);
+                return;
+            },
+            .failed => return error.LoopbackFailed,
+            .waiting => std.Io.sleep(io, .fromMicroseconds(1000), .awake) catch {},
+        }
+    }
+    return error.NoQuery;
 }
 
 test "stopping a listener nobody ever connected to is clean" {
     if (builtin.target.cpu.arch == .wasm32) return error.SkipZigTest;
     const io = std.testing.io;
     const pkce = Pkce.generate(io);
-    const lb = try Loopback.start(std.testing.allocator, io, pkce.state);
+    const lb = try Loopback.start(std.testing.allocator, io, pkce.state, .{});
     lb.stop();
 }
 
@@ -390,7 +458,7 @@ test "an idle connection before the redirect does not consume the listener" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const pkce = Pkce.generate(io);
-    const lb = try Loopback.start(a, io, pkce.state);
+    const lb = try Loopback.start(a, io, pkce.state, .{});
     defer lb.stop();
     // A speculative connection that says nothing and goes away, then a favicon request.
     const idle = try lb.server.socket.address.connect(io, .{ .mode = .stream });
@@ -413,9 +481,9 @@ test "an idle connection before the redirect does not consume the listener" {
     var spins: usize = 0;
     while (spins < 5000) : (spins += 1) {
         switch (lb.take()) {
-            .code => |c| {
-                defer a.free(c);
-                try std.testing.expectEqualStrings("abc", c);
+            .query => |q| {
+                defer a.free(q);
+                try std.testing.expectEqualStrings("abc", queryParam(q, "code").?);
                 return;
             },
             .failed => return error.LoopbackFailed,
@@ -430,7 +498,7 @@ test "a redirect with the wrong state is refused" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const pkce = Pkce.generate(io);
-    const lb = try Loopback.start(a, io, pkce.state);
+    const lb = try Loopback.start(a, io, pkce.state, .{});
     defer lb.stop();
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();
@@ -444,7 +512,7 @@ test "a redirect with the wrong state is refused" {
     while (spins < 5000) : (spins += 1) {
         switch (lb.take()) {
             .failed => return,
-            .code => return error.AcceptedForgedState,
+            .query => return error.AcceptedForgedState,
             .waiting => std.Io.sleep(io, .fromMicroseconds(1000), .awake) catch {},
         }
     }

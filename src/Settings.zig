@@ -7,8 +7,13 @@ const settings = sdk.settings;
 
 root_folder_id: settings.Value([]const u8, .{
     .name = "Root folder id",
-    .description = "The Drive folder that appears as the mount's root. \"root\" is My Drive; a folder's id (from its URL) mounts just that folder.",
+    .description = "The Drive folder that appears as the mount's root: \"root\" is My Drive; otherwise the folder chosen with Open Google Drive Folder….",
 }) = .init("root"),
+
+root_folder_name: settings.Value([]const u8, .{
+    .name = "Root folder name",
+    .description = "The chosen folder's name, which names the mount: gdrive://<account>/<name>.",
+}) = .init(""),
 
 account: settings.Value([]const u8, .{
     .name = "Account",
