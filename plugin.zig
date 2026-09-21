@@ -36,6 +36,7 @@ var plugin: sdk.Plugin = .{
 
 const vtable: sdk.Plugin.VTable = .{
     .deinit = deinit,
+    .initPlugin = initPlugin,
     .beginFrame = beginFrame,
     .needsContinuousRepaint = needsContinuousRepaint,
 };
@@ -54,6 +55,9 @@ const State = struct {
     settings: Settings = .{},
     native_transport: if (is_wasm) void else core.transport.Native = if (is_wasm) {} else undefined,
     transport: vfs.http.Transport = undefined,
+    /// Set by `initPlugin`. Nothing that needs `dvui.io` may run before: in a dylib, `register`
+    /// runs before the host injects it.
+    ready: bool = false,
 
     phase: Phase = .signed_out,
     /// The desktop flow's listener while a browser tab is open. Native only.
@@ -95,12 +99,6 @@ pub fn register(host: *sdk.Host) !void {
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.* = .{};
-    if (!is_wasm) {
-        st.native_transport = core.transport.Native.init(gpa, dvui.io, wakeHost);
-        st.transport = st.native_transport.transport();
-    } else {
-        st.transport = core.transport.Web.transport(gpa);
-    }
     plugin.state = @ptrCast(st);
 
     try host.registerPlugin(&plugin);
@@ -137,11 +135,27 @@ pub fn register(host: *sdk.Host) !void {
         });
     }
 
+}
+
+/// After the host injected its dvui globals: the transport (which keeps `dvui.io`), and the
+/// silent sign-in a saved refresh token allows.
+fn initPlugin(ptr: *anyopaque) anyerror!void {
+    const st = stateOf(ptr);
+    if (st.ready) return;
+    const gpa = sdk.allocator();
+    if (!is_wasm) {
+        st.native_transport = core.transport.Native.init(gpa, dvui.io, wakeHost);
+        st.transport = st.native_transport.transport();
+    } else {
+        st.transport = core.transport.Web.transport(gpa);
+    }
+    st.ready = true;
+
     // A saved refresh token means the user signed in before: pick up where they left off. It
     // lives in the host's secret store; one left in settings by an earlier build moves over.
     if (!is_wasm) {
         if (st.settings.refresh_token.get().len != 0) {
-            host.setSecret(secret_refresh_token, st.settings.refresh_token.get()) catch {};
+            sdk.host().setSecret(secret_refresh_token, st.settings.refresh_token.get()) catch {};
             setSetting(st, "refresh_token", "");
         }
         if (refreshToken(st).len != 0) startRefresh(st);
@@ -165,7 +179,7 @@ fn deinit(ptr: *anyopaque) void {
     const st = stateOf(ptr);
     const gpa = sdk.allocator();
     signOut(st, false);
-    if (!is_wasm) st.native_transport.deinit();
+    if (!is_wasm and st.ready) st.native_transport.deinit();
     Schema.deinit(&st.settings);
     gpa.destroy(st);
 }
@@ -236,6 +250,7 @@ fn drawFileMenuSection(_: ?*anyopaque) anyerror!void {
 
 fn beginFrame(ptr: *anyopaque) void {
     const st = stateOf(ptr);
+    if (!st.ready) return;
     // Own requests land here; once mounted the table pumps the same transport too, which is
     // harmless — a completion is delivered once.
     st.transport.pump();
@@ -272,6 +287,7 @@ fn needsContinuousRepaint(ptr: *anyopaque) bool {
 // ---- sign in ----------------------------------------------------------------------------------
 
 fn signIn(st: *State) void {
+    if (!st.ready) return complain("Google Drive is still starting; try again in a moment.");
     // A retry while the previous browser tab is still open: drop that attempt first.
     if (st.phase == .awaiting_code) signOut(st, false);
     if (st.phase != .signed_out) return;
