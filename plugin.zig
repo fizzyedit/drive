@@ -129,14 +129,14 @@ pub fn register(host: *sdk.Host) !void {
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "open"),
         .owner = &plugin,
-        .title = "Open Google Drive",
+        .title = "Open Whole Drive",
         .run = cmdOpen,
         .isEnabled = cmdOpenEnabled,
     });
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "open_folder"),
         .owner = &plugin,
-        .title = "Open Google Drive Folder…",
+        .title = "Open Drive Folder",
         .run = cmdOpenFolder,
         .isEnabled = cmdMounted,
     });
@@ -146,6 +146,13 @@ pub fn register(host: *sdk.Host) !void {
         .title = "Disconnect Google Drive",
         .run = cmdSignOut,
         .isEnabled = cmdSignOutEnabled,
+    });
+    try host.registerOpenAction(.{
+        .id = "drive.open_folder",
+        .owner = &plugin,
+        .title = "Open Drive Folder",
+        .command = sdk.Plugin.commandId(plugin_id, "open_folder"),
+        .sf_symbol = "folder.badge.gearshape",
     });
     try host.registerAccountProvider(.{
         .id = "drive.google",
@@ -165,7 +172,7 @@ pub fn register(host: *sdk.Host) !void {
             .id = "drive.native.open_folder",
             .owner = &plugin,
             .parent_menu_id = "fizzy.menu.file",
-            .title = "Open Google Drive Folder…",
+            .title = "Open Drive Folder",
             .command = sdk.Plugin.commandId(plugin_id, "open_folder"),
             .run = nativeOpenFolder,
         });
@@ -311,9 +318,6 @@ fn drawFileMenuSection(_: ?*anyopaque) anyerror!void {
         if (host.drawMenuItem("Connect Google Drive… (retry)", sdk.Plugin.commandId(plugin_id, "sign_in"))) signIn(st);
         if (host.drawMenuItem("Cancel Google sign-in", sdk.Plugin.commandId(plugin_id, "sign_out"))) signOut(st, false);
     } else {
-        if (st.phase == .mounted) {
-            if (host.drawMenuItem("Open Google Drive Folder…", sdk.Plugin.commandId(plugin_id, "open_folder"))) openPicker(st);
-        }
         const label = std.fmt.allocPrint(host.arena(), "Disconnect Google Drive ({s})", .{
             if (st.account.len != 0) st.account else "signing in…",
         }) catch "Disconnect Google Drive";
@@ -563,7 +567,7 @@ fn remount(st: *State, folder_id: []const u8, folder_name: []const u8) void {
     if (st.prefix.len != 0) gpa.free(st.prefix);
     st.prefix = &.{};
     st.phase = .account;
-    mountDrive(st, email) catch |err| {
+    mountDrive(st, email, true) catch |err| {
         dvui.log.err("drive: mount failed: {t}", .{err});
         fail(st, "could not mount the drive");
     };
@@ -664,7 +668,7 @@ fn onAbout(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
     defer parsed.deinit();
     const email = parsed.value.user.emailAddress;
     if (email.len == 0) return fail(st, "Google did not say whose drive this is");
-    mountDrive(st, email) catch |err| {
+    mountDrive(st, email, false) catch |err| {
         dvui.log.err("drive: mount failed: {t}", .{err});
         return fail(st, "could not mount the drive");
     };
@@ -728,12 +732,12 @@ fn providerSignIn(ctx: ?*anyopaque) void {
 fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
     const st: *State = @ptrCast(@alignCast(ctx.?));
     const host = sdk.host();
-    if (host.drawMenuItem("Open Google Drive Folder…", sdk.Plugin.commandId(plugin_id, "open_folder"))) {
+    if (host.drawMenuItem("Open Drive Folder", sdk.Plugin.commandId(plugin_id, "open_folder"))) {
         openPicker(st);
         return true;
     }
     if (!rootIsDrive(st)) {
-        if (host.drawMenuItem("Open Google Drive", sdk.Plugin.commandId(plugin_id, "open"))) {
+        if (host.drawMenuItem("Open Whole Drive", sdk.Plugin.commandId(plugin_id, "open"))) {
             openAsRoot(st);
             return true;
         }
@@ -745,7 +749,7 @@ fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
     return false;
 }
 
-fn mountDrive(st: *State, email: []const u8) !void {
+fn mountDrive(st: *State, email: []const u8, open_it: bool) !void {
     const gpa = sdk.allocator();
     const account = try gpa.dupe(u8, email);
     errdefer gpa.free(account);
@@ -770,10 +774,11 @@ fn mountDrive(st: *State, email: []const u8) !void {
     st.client = client;
     st.phase = .mounted;
     setSetting(st, "account", email);
-    // The drive becomes the open root, replacing whatever was — there is one root, and it
-    // closes like any other (Close on its row, File › Close Folder, or Disconnect).
-    sdk.host().setProjectFolder(prefix) catch |err| dvui.log.warn("drive: could not open {s} as the folder: {t}", .{ prefix, err });
-    if (std.mem.eql(u8, root_id, "root")) {
+    // Signing in only mounts (the explorer shows nothing until a drive folder is opened;
+    // a recent gdrive path can now resolve). Opening a folder — the picker, Open Whole
+    // Drive — makes it the root, replacing whatever was; it closes like any other root.
+    if (open_it) sdk.host().setProjectFolder(prefix) catch |err| dvui.log.warn("drive: could not open {s} as the folder: {t}", .{ prefix, err });
+    if (!open_it and std.mem.eql(u8, root_id, "root")) {
         const msg = std.fmt.allocPrint(sdk.host().arena(), "Google Drive connected as {s}.", .{email}) catch "Google Drive connected.";
         dvui.toast(@src(), .{ .message = msg });
     }
