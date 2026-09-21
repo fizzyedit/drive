@@ -37,9 +37,11 @@ root_folder_id: settings.Value([]const u8, .{
     .description = "The Drive folder that appears as the mount's root. \"root\" is My Drive; a folder's id (from its URL) mounts just that folder.",
 }) = .init("root"),
 
+/// No longer written: the token lives in the host's secret store (`Host.setSecret`). Kept so a
+/// value saved by an earlier build is found and moved over on load.
 refresh_token: settings.Value([]const u8, .{
-    .name = "Refresh token",
-    .description = "Written by Sign In (desktop only). Clear it to sign out for good.",
+    .name = "Refresh token (legacy)",
+    .description = "Older builds kept the refresh token here; it now lives in fizzy's private secret store and this is moved there on load.",
     .secret = true,
 }) = .init(""),
 

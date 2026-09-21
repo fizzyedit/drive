@@ -137,8 +137,15 @@ pub fn register(host: *sdk.Host) !void {
         });
     }
 
-    // A saved refresh token means the user signed in before: pick up where they left off.
-    if (!is_wasm and st.settings.refresh_token.get().len != 0) startRefresh(st);
+    // A saved refresh token means the user signed in before: pick up where they left off. It
+    // lives in the host's secret store; one left in settings by an earlier build moves over.
+    if (!is_wasm) {
+        if (st.settings.refresh_token.get().len != 0) {
+            host.setSecret(secret_refresh_token, st.settings.refresh_token.get()) catch {};
+            setSetting(st, "refresh_token", "");
+        }
+        if (refreshToken(st).len != 0) startRefresh(st);
+    }
 }
 
 pub fn pluginPtr() *sdk.Plugin {
@@ -165,6 +172,19 @@ fn deinit(ptr: *anyopaque) void {
 
 fn wakeHost() void {
     sdk.refresh();
+}
+
+const secret_refresh_token = "drive.refresh_token";
+
+/// The saved refresh token, from the host's secret store.
+fn refreshToken(_: *State) []const u8 {
+    return sdk.host().getSecret(secret_refresh_token) orelse "";
+}
+
+fn storeRefreshToken(value: []const u8) void {
+    sdk.host().setSecret(secret_refresh_token, value) catch |err| {
+        dvui.log.warn("drive: could not store the refresh token: {t}", .{err});
+    };
 }
 
 fn scopeOf(st: *State) []const u8 {
@@ -315,7 +335,7 @@ fn startExchange(st: *State, code: []const u8, port: u16) void {
 fn startRefresh(st: *State) void {
     if (is_wasm) return;
     const gpa = sdk.allocator();
-    const body = oauth.refreshBody(gpa, st.settings.client_id.get(), st.settings.client_secret.get(), st.settings.refresh_token.get()) catch return fail(st, "out of memory");
+    const body = oauth.refreshBody(gpa, st.settings.client_id.get(), st.settings.client_secret.get(), refreshToken(st)) catch return fail(st, "out of memory");
     if (st.phase == .signed_out) st.phase = .token;
     postForm(st, oauth.token_endpoint, body, onToken);
 }
@@ -351,14 +371,14 @@ fn onToken(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
         if (resp.status == 400 or resp.status == 401) {
             // A refresh token Google no longer honours is not worth keeping, and a mount it
             // can no longer refresh is not worth keeping up.
-            setSetting(st, "refresh_token", "");
+            storeRefreshToken("");
             signOut(st, false);
             return complain("Google Drive: the saved sign-in is no longer valid; connect again.");
         }
         return fail(st, "Google refused the sign-in");
     }
     setToken(st, parsed.value.access_token, parsed.value.expires_in);
-    if (parsed.value.refresh_token) |rt| setSetting(st, "refresh_token", rt);
+    if (parsed.value.refresh_token) |rt| storeRefreshToken(rt);
     afterToken(st);
 }
 
@@ -488,7 +508,7 @@ fn signOut(st: *State, forget: bool) void {
     if (is_wasm) core.transport.WebOAuth.cancel();
     st.phase = .signed_out;
     if (forget) {
-        setSetting(st, "refresh_token", "");
+        storeRefreshToken("");
         setSetting(st, "account", "");
     }
     sdk.refresh();
