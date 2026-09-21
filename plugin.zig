@@ -20,6 +20,7 @@ const core = @import("core");
 const Settings = @import("src/Settings.zig");
 const oauth = @import("src/oauth.zig");
 const drive = @import("src/drive.zig");
+const FolderChooser = @import("src/FolderChooser.zig");
 /// The app's OAuth clients, baked in at build time (see `credentials.zon.example`).
 const credentials = @import("credentials.zon");
 
@@ -124,6 +125,13 @@ pub fn register(host: *sdk.Host) !void {
         .isEnabled = cmdOpenEnabled,
     });
     try host.registerCommand(.{
+        .id = sdk.Plugin.commandId(plugin_id, "open_folder"),
+        .owner = &plugin,
+        .title = "Open Google Drive Folder…",
+        .run = cmdOpenFolder,
+        .isEnabled = cmdMounted,
+    });
+    try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "sign_out"),
         .owner = &plugin,
         .title = "Disconnect Google Drive",
@@ -142,6 +150,14 @@ pub fn register(host: *sdk.Host) !void {
         .draw = drawFileMenuSection,
     });
     if (!is_wasm) {
+        try host.registerNativeMenuItem(.{
+            .id = "drive.native.open_folder",
+            .owner = &plugin,
+            .parent_menu_id = "fizzy.menu.file",
+            .title = "Open Google Drive Folder…",
+            .command = sdk.Plugin.commandId(plugin_id, "open_folder"),
+            .run = nativeOpenFolder,
+        });
         try host.registerNativeMenuItem(.{
             .id = "drive.native.sign_in",
             .owner = &plugin,
@@ -247,6 +263,13 @@ fn cmdOpenEnabled(ptr: *anyopaque) bool {
     const st = stateOf(ptr);
     return st.phase == .mounted and !rootIsDrive(st);
 }
+fn cmdOpenFolder(ptr: *anyopaque) anyerror!void {
+    const st = stateOf(ptr);
+    if (st.phase == .mounted) FolderChooser.open(st.prefix);
+}
+fn cmdMounted(ptr: *anyopaque) bool {
+    return stateOf(ptr).phase == .mounted;
+}
 
 /// Whether the open folder is this drive.
 fn rootIsDrive(st: *State) bool {
@@ -261,6 +284,10 @@ fn openAsRoot(st: *State) void {
     sdk.host().setProjectFolder(st.prefix) catch |err| dvui.log.warn("drive: could not open {s}: {t}", .{ st.prefix, err });
 }
 
+fn nativeOpenFolder(_: ?*anyopaque) anyerror!void {
+    const st = stateOf(plugin.state);
+    if (st.phase == .mounted) FolderChooser.open(st.prefix);
+}
 fn nativeSignIn(_: ?*anyopaque) anyerror!void {
     signIn(stateOf(plugin.state));
 }
@@ -274,8 +301,8 @@ fn drawFileMenuSection(_: ?*anyopaque) anyerror!void {
         if (host.drawMenuItem("Connect Google Drive… (retry)", sdk.Plugin.commandId(plugin_id, "sign_in"))) signIn(st);
         if (host.drawMenuItem("Cancel Google sign-in", sdk.Plugin.commandId(plugin_id, "sign_out"))) signOut(st, false);
     } else {
-        if (st.phase == .mounted and !rootIsDrive(st)) {
-            if (host.drawMenuItem("Open Google Drive", sdk.Plugin.commandId(plugin_id, "open"))) openAsRoot(st);
+        if (st.phase == .mounted) {
+            if (host.drawMenuItem("Open Google Drive Folder…", sdk.Plugin.commandId(plugin_id, "open_folder"))) FolderChooser.open(st.prefix);
         }
         const label = std.fmt.allocPrint(host.arena(), "Disconnect Google Drive ({s})", .{
             if (st.account.len != 0) st.account else "signing in…",
@@ -520,13 +547,36 @@ fn drawRailItem(_: ?*anyopaque, size: f32) anyerror!void {
     const st = stateOf(plugin.state);
     const theme = dvui.themeGet();
 
+    // The same cell as the rail's own icons (`Sidebar.drawOption`): a button the icon's
+    // height, the glyph centred in it.
     var bw: dvui.ButtonWidget = undefined;
-    bw.init(@src(), .{}, .{ .min_size_content = .{ .w = size, .h = size }, .background = false, .padding = dvui.Rect.all(0), .margin = dvui.Rect.all(0) });
+    bw.init(@src(), .{}, .{ .min_size_content = .{ .h = size } });
     defer bw.deinit();
     bw.processEvents();
     bw.drawBackground();
 
     const signed_in = st.phase == .mounted;
+    const rest = theme.color(.window, .fill);
+    const lit = theme.color(.window, .text);
+    const disc_color = if (signed_in) theme.color(.highlight, .fill) else if (bw.hovered()) lit else rest;
+
+    // The disc: a round box the size of an icon. Signed in with a picture, the picture fills
+    // it; otherwise it is a ring around a smaller user glyph.
+    var disc = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .min_size_content = .{ .w = size, .h = size },
+        .max_size_content = .{ .w = size, .h = size },
+        .corners = .all(1000),
+        .background = true,
+        .color_fill = .{ .color = if (signed_in and st.avatar != null) .transparent else rest.opacity(0.35) },
+        .border = dvui.Rect.all(1),
+        .color_border = .{ .color = disc_color },
+        .padding = dvui.Rect.all(0),
+        .margin = dvui.Rect.all(0),
+        .gravity_x = 0.5,
+        .gravity_y = 0.5,
+    });
+    defer disc.deinit();
+
     if (signed_in and st.avatar != null) {
         _ = dvui.image(@src(), .{ .source = st.avatar.?, .shrink = .ratio }, .{
             .min_size_content = .{ .w = size, .h = size },
@@ -534,13 +584,17 @@ fn drawRailItem(_: ?*anyopaque, size: f32) anyerror!void {
             .corners = .all(1000),
             .gravity_x = 0.5,
             .gravity_y = 0.5,
+            .padding = dvui.Rect.all(0),
+            .margin = dvui.Rect.all(0),
         });
     } else {
-        const color = if (signed_in) theme.color(.highlight, .fill) else if (bw.hovered()) theme.color(.window, .text) else theme.color(.window, .fill);
-        core.icon.icon(@src(), "drive-account", dvui.entypo.user, .{ .fill_color = .{ .color = color }, .stroke_color = .{ .color = color } }, .{
-            .min_size_content = .{ .h = size },
+        const glyph = size * 0.6;
+        core.icon.icon(@src(), "drive-account", dvui.entypo.user, .{ .fill_color = .{ .color = disc_color }, .stroke_color = .{ .color = disc_color } }, .{
+            .min_size_content = .{ .w = glyph, .h = glyph },
             .gravity_x = 0.5,
             .gravity_y = 0.5,
+            .padding = dvui.Rect.all(0),
+            .margin = dvui.Rect.all(0),
         });
     }
 
@@ -563,6 +617,10 @@ fn drawRailItem(_: ?*anyopaque, size: f32) anyerror!void {
             const who = std.fmt.allocPrint(arena, "{s}", .{st.account}) catch "Google Drive";
             dvui.labelNoFmt(@src(), who, .{}, .{ .color_text = .{ .color = theme.color(.control, .text) } });
             _ = dvui.separator(@src(), .{ .expand = .horizontal });
+            if (dvui.menuItemLabel(@src(), "Open Google Drive Folder…", .{}, .{ .expand = .horizontal }) != null) {
+                menu_open = false;
+                FolderChooser.open(st.prefix);
+            }
             if (!rootIsDrive(st)) {
                 if (dvui.menuItemLabel(@src(), "Open Google Drive", .{}, .{ .expand = .horizontal }) != null) {
                     menu_open = false;
