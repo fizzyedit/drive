@@ -85,6 +85,11 @@ pub const Mem = struct {
         try self.insert(path, .file, bytes);
     }
 
+    /// Test convenience: a directory, synchronously, creating no parents.
+    pub fn putDir(self: *Mem, path: []const u8) Fs.Error!void {
+        try self.insert(path, .dir, &.{});
+    }
+
     fn get(self: *Mem, path: []const u8) Fs.Error!*Node {
         return self.nodes.getPtr(path) orelse error.NotFound;
     }
