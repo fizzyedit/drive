@@ -58,6 +58,9 @@ pub const Client = struct {
     root_id: []const u8 = "root",
 
     index: std.StringHashMapUnmanaged(Node) = .empty,
+    /// `changes.list` page token: where the next poll continues from. Owned; null until the
+    /// first poll fetched a start token.
+    changes_token: ?[]u8 = null,
     jobs: std.AutoArrayHashMapUnmanaged(u64, *Job) = .empty,
     ready: http.Completions(*Job),
     /// The job whose callback `pump` is inside, so a cancel of it from that callback is a
@@ -80,6 +83,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.changes_token) |t| self.allocator.free(t);
         for (self.jobs.values()) |job| job.destroy();
         self.jobs.deinit(self.allocator);
         self.ready.deinit();
@@ -93,6 +97,24 @@ pub const Client = struct {
 
     pub fn fs(self: *Client) Fs.Fs {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Paths whose contents changed on Drive since the last poll (files the index knew about
+    /// have been forgotten already; directories are un-listed). Owned by the callback.
+    pub const ChangesFn = *const fn (ctx: ?*anyopaque, result: Fs.Error![][]u8) void;
+
+    pub fn freeChanges(allocator: Allocator, paths: [][]u8) void {
+        for (paths) |p| allocator.free(p);
+        allocator.free(paths);
+    }
+
+    /// Ask Drive what changed since the last call. The first call only fetches a start token
+    /// and answers with nothing — changes are relative to a moment, and that is the moment.
+    /// Each path reported is one the index knew: a file's own path when it was modified or
+    /// removed, or its parent when something appeared under a listed directory. The host
+    /// invalidates those listings; nothing here draws.
+    pub fn pollChanges(self: *Client, allocator: Allocator, cb: ChangesFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
+        return self.start("/", null, .{ .changes = .{ .allocator = allocator, .cb = cb, .ctx = ctx } });
     }
 
     /// Drop what the index knows at and beneath `path`, so the next op re-asks Drive. The
@@ -129,6 +151,21 @@ pub const Client = struct {
             self.allocator.free(kv.value.id);
         }
         if (self.index.getPtr(dir)) |node| node.listed = false;
+    }
+
+    /// The path the index holds for a Drive id, or null when it has never listed it.
+    pub fn pathOfId(self: *Client, id: []const u8) ?[]const u8 {
+        var it = self.index.iterator();
+        while (it.next()) |kv| {
+            if (std.mem.eql(u8, kv.value_ptr.id, id)) return kv.key_ptr.*;
+        }
+        return null;
+    }
+
+    fn setChangesToken(self: *Client, token: []const u8) Allocator.Error!void {
+        const copy = try self.allocator.dupe(u8, token);
+        if (self.changes_token) |t| self.allocator.free(t);
+        self.changes_token = copy;
     }
 
     fn isBeneath(path: []const u8, dir: []const u8) bool {
@@ -272,6 +309,8 @@ const Job = struct {
     /// The listed names, in Drive order, so `listDir` returns what this listing saw and not
     /// whatever the index accumulated.
     seen: std.ArrayList([]const u8) = .empty,
+    /// A changes poll's paths, accumulated across its pages. Owned (client allocator).
+    changed: std.ArrayList([]u8) = .empty,
 
     pending: ?http.Job = null,
     url: []u8 = &.{},
@@ -301,6 +340,7 @@ const Job = struct {
         create: struct { kind: Fs.Kind, cb: Fs.DoneFn, ctx: ?*anyopaque },
         rename: struct { cb: Fs.DoneFn, ctx: ?*anyopaque },
         remove: struct { cb: Fs.DoneFn, ctx: ?*anyopaque },
+        changes: struct { allocator: Allocator, cb: Client.ChangesFn, ctx: ?*anyopaque },
     };
 
     /// Set exactly once by `finish`; consumed by `deliver`.
@@ -310,6 +350,7 @@ const Job = struct {
         entries: []Fs.Entry,
         stat: Fs.Stat,
         bytes: []u8,
+        changed: [][]u8,
         ok,
     };
 
@@ -323,8 +364,11 @@ const Job = struct {
         switch (job.result) {
             .entries => |entries| Fs.freeEntries(job.op.list.allocator, entries),
             .bytes => |bytes| job.op.read.allocator.free(bytes),
+            .changed => |paths| Client.freeChanges(job.op.changes.allocator, paths),
             else => {},
         }
+        for (job.changed.items) |p| a.free(p);
+        job.changed.deinit(a);
         a.free(job.path);
         a.free(job.path2);
         a.destroy(job);
@@ -371,6 +415,11 @@ const Job = struct {
             }),
             .read => |o| o.cb(o.ctx, switch (result) {
                 .bytes => |b| b,
+                .err => |e| e,
+                else => unreachable,
+            }),
+            .changes => |o| o.cb(o.ctx, switch (result) {
+                .changed => |c| c,
                 .err => |e| e,
                 else => unreachable,
             }),
@@ -425,12 +474,28 @@ const Job = struct {
         };
     }
 
+    fn requestChanges(job: *Job) Fs.Error!void {
+        const client = job.client;
+        const a = client.allocator;
+        job.phase = .request;
+        const token = client.changes_token orelse {
+            const url = try a.dupe(u8, "https://www.googleapis.com/drive/v3/changes/startPageToken");
+            return client.send(job, .GET, url, null, &.{}, null);
+        };
+        var url: std.ArrayList(u8) = .empty;
+        errdefer url.deinit(a);
+        try url.appendSlice(a, "https://www.googleapis.com/drive/v3/changes?pageSize=1000&fields=newStartPageToken,nextPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,parents))&pageToken=");
+        try appendQueryValue(a, &url, token);
+        try client.send(job, .GET, try url.toOwnedSlice(a), null, &.{}, null);
+    }
+
     /// `resolving` is fully in the index. Decide what comes next.
     fn resolved(job: *Job) Fs.Error!void {
         const client = job.client;
         const a = client.allocator;
         const node = client.index.getPtr(job.resolving) orelse return error.NotFound;
         switch (job.op) {
+            .changes => try job.requestChanges(),
             .list => {
                 if (node.kind != .dir) return error.NotADirectory;
                 // Always refetch — the caller is a cache and this is its miss path.
@@ -639,8 +704,75 @@ const Job = struct {
                 client.drop(job.path);
                 job.complete(.ok);
             },
+            .changes => try job.onChangesPage(body),
             .list, .stat => unreachable,
         }
+    }
+
+    fn onChangesPage(job: *Job, body: []const u8) Fs.Error!void {
+        const client = job.client;
+        const a = client.allocator;
+        const parsed = std.json.parseFromSlice(ChangesResponse, a, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidJson,
+        };
+        defer parsed.deinit();
+        const v = parsed.value;
+
+        // The first poll: only a start token comes back.
+        if (v.startPageToken) |t| {
+            try client.setChangesToken(t);
+            return job.completeChanges();
+        }
+
+        for (v.changes) |ch| {
+            const id = ch.fileId orelse continue;
+            if (client.pathOfId(id)) |known| {
+                // Something the index holds: its own listing (a directory) or its parent's
+                // (a file) is stale, and so is anything cached beneath it.
+                try job.noteChanged(known);
+                const parent = Fs.path.dirname(known);
+                try job.noteChanged(parent);
+                client.forget(known);
+                continue;
+            }
+            // New to us: if it landed in a directory we have listed, that listing is stale.
+            const file = ch.file orelse continue;
+            for (file.parents) |pid| {
+                if (client.pathOfId(pid)) |parent| {
+                    try job.noteChanged(parent);
+                    if (client.index.getPtr(parent)) |pn| pn.listed = false;
+                }
+            }
+        }
+
+        if (v.nextPageToken) |next| {
+            try client.setChangesToken(next);
+            return job.requestChanges();
+        }
+        if (v.newStartPageToken) |t| try client.setChangesToken(t);
+        job.completeChanges();
+    }
+
+    fn noteChanged(job: *Job, path: []const u8) Fs.Error!void {
+        for (job.changed.items) |p| {
+            if (std.mem.eql(u8, p, path)) return;
+        }
+        const copy = try job.client.allocator.dupe(u8, path);
+        errdefer job.client.allocator.free(copy);
+        try job.changed.append(job.client.allocator, copy);
+    }
+
+    fn completeChanges(job: *Job) void {
+        const o = job.op.changes;
+        const out = o.allocator.alloc([]u8, job.changed.items.len) catch return job.finish(error.OutOfMemory);
+        var n: usize = 0;
+        errdefer Client.freeChanges(o.allocator, out[0..n]);
+        for (job.changed.items) |p| {
+            out[n] = o.allocator.dupe(u8, p) catch return job.finish(error.OutOfMemory);
+            n += 1;
+        }
+        job.complete(.{ .changed = out });
     }
 
     /// Re-key everything at or beneath `from` under `to`.
@@ -676,6 +808,27 @@ const File = struct {
 const ListResponse = struct {
     nextPageToken: ?[]const u8 = null,
     files: []const File = &.{},
+};
+
+const ChangedFile = struct {
+    id: []const u8 = "",
+    name: []const u8 = "",
+    mimeType: []const u8 = "",
+    parents: []const []const u8 = &.{},
+};
+
+const Change = struct {
+    fileId: ?[]const u8 = null,
+    removed: bool = false,
+    file: ?ChangedFile = null,
+};
+
+/// `changes.list`, or `changes/startPageToken` (only `startPageToken` set).
+const ChangesResponse = struct {
+    startPageToken: ?[]const u8 = null,
+    newStartPageToken: ?[]const u8 = null,
+    nextPageToken: ?[]const u8 = null,
+    changes: []const Change = &.{},
 };
 
 fn parseFile(allocator: Allocator, body: []const u8) Fs.Error!std.json.Parsed(File) {

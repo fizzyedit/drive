@@ -46,6 +46,10 @@ const Schema = sdk.settings.Schema(Settings);
 /// prompt) never redirect back to the loopback, so without a limit that state is forever.
 const sign_in_timeout_ms: i64 = 5 * 60 * 1000;
 
+/// How often the mount asks Drive what changed. Drive's own change feed is what a folder
+/// watcher is for the disk; a few seconds is fine for edits made elsewhere to show up.
+const poll_interval_ms: i64 = 5000;
+
 const State = struct {
     settings: Settings = .{},
     native_transport: if (is_wasm) void else core.transport.Native = if (is_wasm) {} else undefined,
@@ -70,6 +74,9 @@ const State = struct {
     /// `gdrive://<account>` while mounted. Owned.
     prefix: []u8 = &.{},
     client: ?*drive.Client = null,
+    /// The `changes.list` poll: when it last ran, and whether one is in flight.
+    last_poll_ms: i64 = 0,
+    poll: ?vfs.Job = null,
 
     const Phase = enum {
         signed_out,
@@ -219,6 +226,14 @@ fn beginFrame(ptr: *anyopaque) void {
         if (st.phase == .awaiting_code and nowMs() - st.awaiting_since_ms > sign_in_timeout_ms) {
             signOut(st, false);
             complain("Google sign-in timed out; choose Connect Google Drive to try again.");
+        }
+    }
+
+    // The watcher: what changed on Drive since last time, folded into the table's listings.
+    if (st.phase == .mounted and st.poll == null and nowMs() - st.last_poll_ms > poll_interval_ms) {
+        if (st.client) |client| {
+            st.last_poll_ms = nowMs();
+            st.poll = client.pollChanges(sdk.allocator(), onChanges, st) catch null;
         }
     }
 
@@ -413,6 +428,30 @@ fn mountDrive(st: *State, email: []const u8) !void {
     sdk.refresh();
 }
 
+fn onChanges(ctx: ?*anyopaque, result: vfs.Error![][]u8) void {
+    const st: *State = @ptrCast(@alignCast(ctx.?));
+    st.poll = null;
+    const gpa = sdk.allocator();
+    const paths = result catch |err| {
+        // Silent at frame rate would be a request storm; once a minute is a log line.
+        dvui.log.warn("drive: changes poll failed: {t}", .{err});
+        st.last_poll_ms = nowMs() + 60_000;
+        return;
+    };
+    defer drive.Client.freeChanges(gpa, paths);
+    const files = sdk.host().files orelse return;
+    for (paths) |rel| {
+        const full = std.mem.concat(gpa, u8, &.{ st.prefix, if (vfs.path.isRoot(rel)) "" else rel }) catch continue;
+        defer gpa.free(full);
+        // The listing of the path itself (a directory that changed) and its parent's (a file
+        // that changed or went away).
+        files.invalidateListing(full);
+        if (std.fs.path.dirname(full)) |parent| files.invalidateListing(parent);
+        files.invalidateIndex();
+    }
+    if (paths.len != 0) sdk.refresh();
+}
+
 /// Back to signed out. `forget` also drops the saved refresh token, which is what the user
 /// means by "disconnect"; a failure mid-flow keeps it so the next launch can try again.
 fn signOut(st: *State, forget: bool) void {
@@ -420,6 +459,10 @@ fn signOut(st: *State, forget: bool) void {
     if (st.pending) |job| {
         st.transport.cancel(job);
         st.pending = null;
+    }
+    if (st.poll) |job| {
+        if (st.client) |client| client.fs().cancel(job);
+        st.poll = null;
     }
     if (!is_wasm) {
         if (st.loopback) |l| {

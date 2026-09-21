@@ -149,6 +149,10 @@ const notes_page =
     \\{"files":[{"id":"a1","name":"a.txt","mimeType":"text/plain","size":"7"},{"id":"d1","name":"Doc","mimeType":"application/vnd.google-apps.document"}]}
 ;
 const little_drive = [_]Scripted.Route{
+    .{ .contains = "changes/startPageToken", .body = "{\"startPageToken\":\"100\"}" },
+    .{ .contains = "changes?", .body =
+        \\{"newStartPageToken":"101","changes":[{"fileId":"a1","removed":false,"file":{"id":"a1","name":"a.txt","parents":["n1"]}},{"fileId":"zz","removed":false,"file":{"id":"zz","name":"new.md","mimeType":"text/markdown","parents":["root"]}}]}
+    },
     .{ .contains = "pageToken=p2", .body = root_page2 },
     .{ .contains = "q=%27root%27%20in%20parents", .body = root_page1 },
     .{ .contains = "q=%27n1%27%20in%20parents", .body = notes_page },
@@ -351,6 +355,47 @@ test "a rename within one folder does not move parents" {
     const last = h.scripted.log.items[h.scripted.log.items.len - 1];
     try std.testing.expect(std.mem.indexOf(u8, last.url, "addParents") == null);
     try std.testing.expect(std.mem.indexOf(u8, last.body, "\"name\":\"b.txt\"") != null);
+}
+
+test "changes: the first poll takes a start token, the next reports the paths it touched" {
+    const a = std.testing.allocator;
+    const h = try Harness.init(a, &little_drive);
+    defer h.deinit();
+    // Index root and /notes first, so the changes have something to hit.
+    _ = try h.fs().stat("/notes/a.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+
+    const Got = struct {
+        paths: ?[][]u8 = null,
+        calls: usize = 0,
+        fn cb(ctx: ?*anyopaque, result: Fs.Error![][]u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.paths = result catch null;
+        }
+    };
+    var got: Got = .{};
+    _ = try h.client.pollChanges(a, Got.cb, &got);
+    var spins: usize = 0;
+    while (got.calls == 0 and spins < 32) : (spins += 1) h.fs().pump();
+    try std.testing.expectEqual(@as(usize, 0), got.paths.?.len);
+    drive.Client.freeChanges(a, got.paths.?);
+    try std.testing.expectEqualStrings("100", h.client.changes_token.?);
+
+    got = .{};
+    _ = try h.client.pollChanges(a, Got.cb, &got);
+    spins = 0;
+    while (got.calls == 0 and spins < 32) : (spins += 1) h.fs().pump();
+    const paths = got.paths orelse return error.NoChanges;
+    defer drive.Client.freeChanges(a, paths);
+    // a.txt changed → itself and /notes; new.md appeared under root → "/".
+    try std.testing.expectEqual(@as(usize, 3), paths.len);
+    try std.testing.expectEqualStrings("/notes/a.txt", paths[0]);
+    try std.testing.expectEqualStrings("/notes", paths[1]);
+    try std.testing.expectEqualStrings("/", paths[2]);
+    try std.testing.expectEqualStrings("101", h.client.changes_token.?);
+    // The changed file is gone from the index; its parent will be re-listed.
+    try std.testing.expect(h.client.pathOfId("a1") == null);
 }
 
 test "duplicate sibling names: first listed wins" {
