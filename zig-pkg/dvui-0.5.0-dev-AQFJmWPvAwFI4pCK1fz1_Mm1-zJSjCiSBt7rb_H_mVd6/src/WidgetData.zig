@@ -1,0 +1,418 @@
+const std = @import("std");
+const dvui = @import("dvui.zig");
+
+const Ninepatch = dvui.Ninepatch;
+const Options = dvui.Options;
+const Rect = dvui.Rect;
+const RectScale = dvui.RectScale;
+const CornerRect = dvui.CornerRect;
+const Size = dvui.Size;
+const Widget = dvui.Widget;
+const Id = dvui.Id;
+const WidgetData = @This();
+
+pub const InitOptions = struct {
+    // if true, don't send our rect through our parent because we aren't located inside our parent
+    subwindow: bool = false,
+    scroll_when_focused: bool = true,
+};
+
+id: Id,
+parent: Widget,
+init_options: InitOptions,
+rect: Rect,
+min_size: Size,
+options: Options,
+src: std.builtin.SourceLocation,
+rect_scale: ?RectScale = null,
+ak_node: if (dvui.accesskit_enabled) ?*dvui.AccessKit.Node else void = if (dvui.accesskit_enabled) null else {},
+
+pub fn init(src: std.builtin.SourceLocation, init_options: InitOptions, opts: Options) WidgetData {
+    const parent = dvui.parentGet();
+    const id = parent.extendId(src, opts.idExtra());
+
+    var options = if (dvui.debug.options_override.get(id)) |val| val.@"0" else opts;
+    if (options.corners) |*corners| corners.* = corners.finalize(options.theme);
+    if (options.box_shadow) |*box_shadow| {
+        if (box_shadow.corners) |*corners| corners.* = corners.finalize(options.theme);
+    }
+
+    const min_size = options.min_sizeGet();
+    var ms = min_size;
+    if (dvui.minSizeGet(id)) |min_last_frame| {
+        // Need to take the max of both given and previous.  ScrollArea could be
+        // passed a min size Size{.w = 0, .h = 200} meaning to get the width from the
+        // previous min size.
+        ms = Size.max(ms, min_last_frame);
+    }
+
+    const rect = if (options.rect) |r|
+        r.toSize(.{
+            .w = if (options.expandGet().isHorizontal())
+                parent.data().contentRect().w
+            else if (r.w == 0) ms.w else r.w,
+            .h = if (options.expandGet().isVertical())
+                parent.data().contentRect().h
+            else if (r.h == 0) ms.h else r.h,
+        })
+    else blk: {
+        if (options.expandGet() == .ratio and (ms.w == 0 or ms.h == 0)) {
+            dvui.log.debug("rectFor {x} expand is .ratio but min size is zero\n", .{id});
+        }
+        break :blk parent.rectFor(id, ms, options.expandGet(), options.gravityGet());
+    };
+
+    return .{
+        .id = id,
+        .parent = parent,
+        .init_options = init_options,
+        .min_size = min_size,
+        .rect = rect,
+        .options = options,
+        .src = src,
+    };
+}
+
+pub fn rectSet(self: *WidgetData, r: Rect) void {
+    self.rect = r;
+    self.rect_scale = self.rectScaleFromParent();
+}
+
+pub fn register(self: *WidgetData) void {
+    self.rectSet(self.rect);
+
+    if (self.options.theme) |t| {
+        dvui.currentWindow().addEmbeddedFontsFromTheme(t);
+    }
+
+    if (self.options.role) |role| {
+        _ = dvui.currentWindow().accesskit.nodeCreate(self, role);
+    }
+
+    if (self.options.data_out) |do| {
+        do.* = self.*;
+    }
+
+    // for normal widgets this is fine, but subwindows have to take care to
+    // call captureMouseMaintain after subwindowCurrentSet and subwindowAdd
+    if (!self.init_options.subwindow) {
+        dvui.captureMouseMaintain(.{ .id = self.id, .rect = self.borderRectScale().r, .subwindow_id = dvui.subwindowCurrentId() });
+    }
+
+    var cw = dvui.currentWindow();
+
+    if (self.options.tag) |t| {
+        dvui.tag(t, .{ .id = self.id, .rect = self.rectScale().r, .visible = self.visible() });
+    }
+
+    cw.last_registered_id_this_frame = self.id;
+
+    // First widget to register this frame marks the end of the event phase and
+    // the start of the build phase for frame timing (see `Window.frameTiming`).
+    if (cw.ft_awaiting_build) {
+        cw.ft_awaiting_build = false;
+        cw.ft_build_start = cw.backend.nanoTime();
+    }
+
+    // Record this widget if a machine-readable frame dump is being captured (see
+    // `Debug.captureFrame`/`dumpFrame`). Off by default, so this is one branch.
+    if (dvui.debug.capturing) {
+        dvui.debug.captureWidget(cw.gpa, self);
+    }
+
+    const focused_widget_id = dvui.focusedWidgetId();
+    if (self.id == focused_widget_id) {
+        cw.last_focused_id_this_frame = self.id;
+
+        if (cw.scroll_to_focused) {
+            cw.scroll_to_focused = false;
+            if (self.init_options.scroll_when_focused) {
+                dvui.scrollTo(.{
+                    .screen_rect = self.rectScale().r,
+                });
+            }
+        }
+    }
+
+    if (self.id == dvui.focusedWidgetIdInCurrentSubwindow()) {
+        cw.last_focused_id_in_subwindow = self.id;
+    }
+
+    if (dvui.testing.widget_hasher) |*hasher| {
+        hasher.update(std.mem.asBytes(&self.init_options));
+        hasher.update(std.mem.asBytes(&self.options.hash()));
+        hasher.update(std.mem.asBytes(&self.rectScale()));
+        hasher.update(std.mem.asBytes(&(self.id == focused_widget_id)));
+    }
+
+    if (dvui.debug.target == .focused and self.id == focused_widget_id) {
+        dvui.debug.widget_id = self.id;
+    }
+
+    if (cw.min_sizes.containsUsed(self.id)) |used| {
+        if (used) {
+            const name: []const u8 = self.options.name orelse "???";
+            dvui.log.err("{s}:{d} duplicate widget id {x} (widget \"{s}\" highlighted in red); you may need to pass .{{.id_extra=<loop index>}} as widget options (see https://github.com/david-vanderson/dvui/blob/master/readme-implementation.md#widget-ids )\n", .{ self.src.file, self.src.line, self.id, name });
+            dvui.Debug.errorOutline(self.rectScale().r);
+        }
+    }
+
+    if (dvui.debug.target.mouse() or self.id == dvui.debug.widget_id) {
+        var rs = self.rectScale();
+
+        if (dvui.debug.target.mouse() and
+            rs.r.contains(cw.mouse_pt) and
+            // prevents stuff in scroll area outside viewport being caught
+            dvui.clipGet().contains(cw.mouse_pt) and
+            // prevents stuff in lower subwindows being caught
+            cw.subwindows.windowFor(cw.mouse_pt) == dvui.subwindowCurrentId())
+        {
+            dvui.debug.under_mouse_stack.append(cw.gpa, .{
+                .id = self.id,
+                // Fallback must be empty so that freeing the name will be valid
+                .name = cw.gpa.dupe(u8, self.options.name orelse "") catch "",
+            }) catch |err| {
+                dvui.logError(@src(), err, "Could not add debug info for widgets under mouse position. Widget {x} {s}", .{ self.id, self.options.name orelse "???" });
+            };
+            dvui.debug.widget_id = self.id;
+        }
+
+        if (self.id == dvui.debug.widget_id) {
+            if (dvui.debug.widget_panic) {
+                @panic("Debug Window Panic");
+            }
+
+            dvui.debug.target_wd = self.*;
+            dvui.debug.target_wd.?.parent = undefined;
+
+            dvui.Debug.errorOutline(rs.r);
+        }
+    }
+}
+
+pub fn visible(self: *const WidgetData) bool {
+    return self.borderRectScale().r.visible();
+}
+
+pub fn borderAndBackground(self: *const WidgetData, opts: struct {
+    fill_color: ?dvui.ColorOrGradient = null,
+    ninepatch: ?*const Ninepatch = null,
+    /// If null, 1.0 (0.0 when drawing a ninepatch, which already has its
+    /// own baked edges).
+    fade: ?f32 = null,
+}) void {
+    if (!self.visible()) {
+        return;
+    }
+
+    if (self.options.box_shadow) |bs| {
+        const rs = self.borderRectScale();
+        const corners = bs.corners orelse self.options.cornersGet();
+
+        const prect = rs.r.insetAll(rs.s * bs.shrink).offsetPoint(bs.offset.scale(rs.s, dvui.Point.Physical));
+
+        prect.fill(corners.scale(rs.s, CornerRect.Physical), .{ .color = .{ .color = bs.color.opacity(bs.alpha) }, .fade = rs.s * bs.fade });
+    }
+
+    var bg = self.options.backgroundGet();
+    const b = self.options.borderGet();
+
+    if (b.nonZero()) {
+        const uniform: bool = (b.x == b.y and b.x == b.w and b.x == b.h);
+        if (uniform) {
+            // draw border as stroked path
+            const r = self.borderRect().inset(b.scale(0.5, Rect));
+            const rs = self.rectScale().rectToRectScale(r.offsetNeg(self.rect));
+            rs.r.stroke(self.options.cornersGet().scale(rs.s, CornerRect.Physical), .{
+                .thickness = b.x * rs.s,
+                .color = self.options.color(.border).scale(rs.s),
+            });
+        } else {
+            // non-uniform border, draw it first as large rect with background/ninepatch on top
+            if (!bg) {
+                dvui.log.debug("borderAndBackground {x} forcing background on to support non-uniform border\n", .{self.id});
+                bg = true;
+            }
+
+            var rs = self.borderRectScale();
+            if (!rs.r.empty()) {
+                const fade: f32 = opts.fade orelse 1.0;
+                if (fade > 0) {
+                    // if any border is zero, inset by half the fade so it doesn't bleed out
+                    var inset: Rect.Physical = .{};
+                    if (b.x == 0) inset.x = fade * 0.5;
+                    if (b.y == 0) inset.y = fade * 0.5;
+                    if (b.w == 0) inset.w = fade * 0.5;
+                    if (b.h == 0) inset.h = fade * 0.5;
+                    rs.r = rs.r.inset(inset);
+                }
+                rs.r.fill(self.options.cornersGet().scale(rs.s, CornerRect.Physical), .{
+                    .color = self.options.color(.border).scale(rs.s),
+                    .fade = fade,
+                });
+            }
+        }
+    }
+
+    const ninepatch = opts.ninepatch orelse self.options.ninepatch(.fill);
+
+    if (bg) {
+        const rs = self.backgroundRectScale();
+        if (!rs.r.empty()) {
+            rs.r.fill(self.options.cornersGet().scale(rs.s, CornerRect.Physical), .{
+                .color = (opts.fill_color orelse self.options.color(.fill)).scale(rs.s),
+                .fade = opts.fade orelse (if (ninepatch != null) 0.0 else 1.0),
+            });
+        }
+    }
+
+    // can draw a ninepatch without a background, some of it could be transparent
+    if (ninepatch) |np| {
+        const rs = self.backgroundRectScale();
+        dvui.renderNinepatch(np.*, rs, .{}) catch |err| {
+            dvui.log.err("while drawing ninepatch: {}, {}", .{ err, rs });
+        };
+    }
+}
+
+pub fn focusBorder(self: *const WidgetData) void {
+    if (self.visible()) {
+        const rs = self.borderRectScale();
+        const thick = 2 * rs.s;
+
+        rs.r.stroke(self.options.cornersGet().scale(rs.s, CornerRect.Physical), .{ .thickness = thick, .color = .{ .color = self.options.themeGet().focus }, .after = true });
+    }
+}
+
+pub fn rectScaleFromParent(self: *const WidgetData) RectScale {
+    return if (self.init_options.subwindow)
+        dvui.windowRectScale().rectToRectScale(self.rect)
+    else
+        self.parent.screenRectScale(self.rect);
+}
+
+pub fn rectScale(self: *const WidgetData) RectScale {
+    if (self.rect_scale) |rs| {
+        return rs;
+    }
+
+    // This can happen if a widget calls rectScale before calling register.
+    // Reorderable does that to check if one is being dragged over another.
+    return self.rectScaleFromParent();
+}
+
+pub fn borderRect(self: *const WidgetData) Rect {
+    return self.rect.inset(self.options.marginGet());
+}
+
+pub fn borderRectScale(self: *const WidgetData) RectScale {
+    const r = self.borderRect().offsetNeg(self.rect);
+    return self.rectScale().rectToRectScale(r);
+}
+
+pub fn backgroundRect(self: *const WidgetData) Rect {
+    return self.rect.inset(self.options.marginGet()).inset(self.options.borderGet());
+}
+
+pub fn backgroundRectScale(self: *const WidgetData) RectScale {
+    const r = self.backgroundRect().offsetNeg(self.rect);
+    return self.rectScale().rectToRectScale(r);
+}
+
+pub fn contentRect(self: *const WidgetData) Rect {
+    return self.rect.inset(self.options.marginGet()).inset(self.options.borderGet()).inset(self.options.paddingGet());
+}
+
+pub fn contentRectScale(self: *const WidgetData) RectScale {
+    const r = self.contentRect().offsetNeg(self.rect);
+    return self.rectScale().rectToRectScale(r);
+}
+
+pub fn minSizeMax(self: *WidgetData, s: Size) void {
+    self.min_size = Size.max(self.min_size, s);
+}
+
+pub fn minSizeSetAndRefresh(self: *WidgetData) void {
+    self.min_size = self.min_size.min(self.options.max_sizeGet());
+
+    if (dvui.minSizeGet(self.id)) |ms| {
+        // If the size we got was exactly our previous min size then our min size
+        // was a binding constraint.  So if our min size changed it might cause
+        // layout changes.
+
+        // If this was like a Label where we knew the min size before getting our
+        // rect, then either our min size is the same as previous, or our rect is
+        // a different size than our previous min size.
+        if ((self.rect.w == ms.w and ms.w != self.min_size.w) or
+            (self.rect.h == ms.h and ms.h != self.min_size.h))
+        {
+            //std.debug.print("{x} minSizeSetAndRefresh {} {} {}\n", .{ self.id, self.rect, ms, self.min_size });
+
+            dvui.refresh(null, @src(), self.id);
+        }
+    } else {
+        // This is the first frame for this widget.  Almost always need a
+        // second frame to appear correctly since nobody knew our min size the
+        // first frame.
+        dvui.refresh(null, @src(), self.id);
+    }
+
+    var cw = dvui.currentWindow();
+
+    cw.min_sizes.put(cw.gpa, self.id, self.min_size) catch |err| {
+        // returning an error here means that all widgets deinit can return
+        // it, which is very annoying because you can't "defer try
+        // widget.deinit()".  Also if we are having memory issues then we
+        // have larger problems than here.
+        dvui.log.err("minSizeSetAndRefresh got {any} when trying to set min size of widget {x}\n", .{ err, self.id });
+    };
+}
+
+pub fn minSizeReportToParent(self: *const WidgetData) void {
+    if (self.options.rect == null) {
+        self.parent.minSizeForChild(self.min_size);
+    }
+}
+
+pub fn validate(self: *const WidgetData) *WidgetData {
+    std.debug.assert(self.id != Id.undef); // Indicates a use after deinit() error.
+    return @constCast(self);
+}
+
+pub fn isRoot(self: *const WidgetData) bool {
+    // Window is its own parent
+    return (self.id == self.parent.data().id);
+}
+
+pub const ParentIterator = struct {
+    wd: ?*const WidgetData,
+
+    pub fn next(it: *ParentIterator) ?*const WidgetData {
+        const ret = it.wd;
+
+        if (it.wd) |wd| {
+            if (wd.isRoot()) {
+                it.wd = null;
+            } else {
+                it.wd = wd.parent.data();
+            }
+        }
+
+        return ret;
+    }
+};
+
+pub fn iterator(self: *const WidgetData) ParentIterator {
+    return .{ .wd = self };
+}
+
+// NOTE: `inline` is required so that null will be returned at comptime. Otherwise other
+//       accesskit functions, which are not linked, might be referenced and fail to compile
+pub inline fn accesskit_node(self: *const WidgetData) ?*dvui.AccessKit.Node {
+    if (!dvui.accesskit_enabled) return null;
+    return self.ak_node;
+}
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

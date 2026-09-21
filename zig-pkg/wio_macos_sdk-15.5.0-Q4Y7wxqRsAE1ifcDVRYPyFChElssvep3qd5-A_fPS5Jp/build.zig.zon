@@ -1,0 +1,12 @@
+.{
+    .name = .wio_macos_sdk,
+    .version = "15.5.0",
+    .fingerprint = 0xa4f0bd4cc33b8643,
+    .paths = .{
+        "build.zig.zon",
+        "System",
+        "usr",
+        "README.md",
+        "xcode.pdf",
+    },
+}

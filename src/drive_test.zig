@@ -2,8 +2,9 @@
 //! fills, and what the caller sees — with no network.
 
 const std = @import("std");
-const Fs = @import("Fs.zig");
-const http = @import("http.zig");
+const vfs = @import("core").vfs;
+const Fs = vfs;
+const http = vfs.http;
 const drive = @import("drive.zig");
 const Allocator = std.mem.Allocator;
 

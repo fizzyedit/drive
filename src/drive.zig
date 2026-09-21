@@ -24,8 +24,9 @@
 //! this frame.
 
 const std = @import("std");
-const Fs = @import("Fs.zig");
-const http = @import("http.zig");
+const vfs = @import("core").vfs;
+const Fs = vfs;
+const http = vfs.http;
 const Allocator = std.mem.Allocator;
 
 pub const folder_mime = "application/vnd.google-apps.folder";
@@ -94,12 +95,12 @@ pub const Client = struct {
     /// Drop what the index knows at and beneath `path`, so the next op re-asks Drive. The
     /// root is never dropped, only un-listed.
     pub fn forget(self: *Client, path: []const u8) void {
-        if (Fs.isRoot(path)) {
+        if (Fs.path.isRoot(path)) {
             self.forgetChildren("/");
             return;
         }
         self.drop(path);
-        if (self.index.getPtr(Fs.dirname(path))) |parent| parent.listed = false;
+        if (self.index.getPtr(Fs.path.dirname(path))) |parent| parent.listed = false;
     }
 
     /// Remove `path` and everything beneath it from the index, trusting the parent's listing
@@ -128,7 +129,7 @@ pub const Client = struct {
     }
 
     fn isBeneath(path: []const u8, dir: []const u8) bool {
-        if (Fs.isRoot(dir)) return !Fs.isRoot(path);
+        if (Fs.path.isRoot(dir)) return !Fs.path.isRoot(path);
         return path.len > dir.len and std.mem.startsWith(u8, path, dir) and path[dir.len] == '/';
     }
 
@@ -163,22 +164,22 @@ pub const Client = struct {
     }
     fn startCreateFile(ptr: *anyopaque, path: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        if (Fs.isRoot(path)) return error.Exists;
+        if (Fs.path.isRoot(path)) return error.Exists;
         return self.start(path, null, .{ .create = .{ .kind = .file, .cb = cb, .ctx = ctx } });
     }
     fn startMkdir(ptr: *anyopaque, path: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        if (Fs.isRoot(path)) return error.Exists;
+        if (Fs.path.isRoot(path)) return error.Exists;
         return self.start(path, null, .{ .create = .{ .kind = .dir, .cb = cb, .ctx = ctx } });
     }
     fn startRename(ptr: *anyopaque, path: []const u8, new_path: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        if (Fs.isRoot(path) or Fs.isRoot(new_path)) return error.Unsupported;
+        if (Fs.path.isRoot(path) or Fs.path.isRoot(new_path)) return error.Unsupported;
         return self.start(path, new_path, .{ .rename = .{ .cb = cb, .ctx = ctx } });
     }
     fn startRemove(ptr: *anyopaque, path: []const u8, cb: Fs.DoneFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        if (Fs.isRoot(path)) return error.Unsupported;
+        if (Fs.path.isRoot(path)) return error.Unsupported;
         return self.start(path, null, .{ .remove = .{ .cb = cb, .ctx = ctx } });
     }
 
@@ -385,7 +386,7 @@ const Job = struct {
                 if (job.resolving.len == 0) job.resolving = job.firstResolve();
                 // Walk as far as the index already knows.
                 var dir: []const u8 = "/";
-                var it = Fs.segments(job.resolving);
+                var it = Fs.path.segments(job.resolving);
                 while (it.next()) |seg| {
                     const child_path_end = @intFromPtr(seg.ptr) + seg.len - @intFromPtr(job.resolving.ptr);
                     const child_path = job.resolving[0..child_path_end];
@@ -408,7 +409,7 @@ const Job = struct {
     /// and then lists it; creates resolve the parent and need it listed (to answer `Exists`).
     fn firstResolve(job: *Job) []const u8 {
         return switch (job.op) {
-            .create => Fs.dirname(job.path),
+            .create => Fs.path.dirname(job.path),
             else => job.path,
         };
     }
@@ -446,7 +447,7 @@ const Job = struct {
                 if (!node.listed) return job.beginListing(job.resolving);
                 if (client.index.contains(job.path)) return error.Exists;
                 const meta = try std.json.Stringify.valueAlloc(a, .{
-                    .name = Fs.basename(job.path),
+                    .name = Fs.path.basename(job.path),
                     .parents = [_][]const u8{node.id},
                     .mimeType = if (o.kind == .dir) @as(?[]const u8, folder_mime) else null,
                 }, .{ .emit_null_optional_fields = false });
@@ -459,15 +460,15 @@ const Job = struct {
                 if (std.mem.eql(u8, job.resolving, job.path)) {
                     // Source found; now the destination's parent, which must be listed so a
                     // clash is caught before Drive silently creates a duplicate.
-                    job.resolving = Fs.dirname(job.path2);
+                    job.resolving = Fs.path.dirname(job.path2);
                     return job.stepInner();
                 }
                 if (node.kind != .dir) return error.NotADirectory;
                 if (!node.listed) return job.beginListing(job.resolving);
                 if (client.index.contains(job.path2)) return error.Exists;
                 const src = client.index.getPtr(job.path).?;
-                const old_parent = client.index.getPtr(Fs.dirname(job.path)).?;
-                const meta = try std.json.Stringify.valueAlloc(a, .{ .name = Fs.basename(job.path2) }, .{});
+                const old_parent = client.index.getPtr(Fs.path.dirname(job.path)).?;
+                const meta = try std.json.Stringify.valueAlloc(a, .{ .name = Fs.path.basename(job.path2) }, .{});
                 errdefer a.free(meta);
                 const url = try std.fmt.allocPrint(a, "{s}/{s}?addParents={s}&removeParents={s}&fields={s}", .{
                     api, src.id, node.id, old_parent.id, file_fields,
@@ -539,7 +540,7 @@ const Job = struct {
 
         const for_caller = job.op == .list and std.mem.eql(u8, job.listing, job.path);
         for (parsed.value.files) |file| {
-            const child = try Fs.join(a, job.listing, file.name);
+            const child = try Fs.path.join(a, job.listing, file.name);
             // First-listed wins: Drive allows siblings with one name; a path cannot.
             if (client.index.contains(child)) {
                 a.free(child);
@@ -581,7 +582,7 @@ const Job = struct {
             entries.deinit(o.allocator);
         }
         for (job.seen.items) |name| {
-            const child = try Fs.join(client.allocator, job.path, name);
+            const child = try Fs.path.join(client.allocator, job.path, name);
             defer client.allocator.free(child);
             const node = client.index.get(child) orelse continue;
             const copy = try o.allocator.dupe(u8, name);
@@ -764,3 +765,4 @@ test "rfc3339 to ms" {
 test {
     _ = @import("drive_test.zig");
 }
+

@@ -1,0 +1,564 @@
+class Wio {
+    constructor(canvases) {
+        /** @type {WebAssembly.Memory} */
+        this.memory = undefined;
+
+        /** @type {WebAssembly.Module} */
+        this.module = undefined;
+
+        /** @type {WebAssembly.Instance} */
+        this.instance = undefined;
+
+        /** @type {HTMLCanvasElement[]} */
+        this.canvases = canvases;
+
+        this.objects = [,];
+
+        this.draw_available_windows = [];
+
+        this.modifiers = 0;
+
+        this.gamepads = navigator.getGamepads();
+
+        this.buffer = "";
+    }
+
+    run(memory, module, instance) {
+        this.memory = memory;
+        this.module = module;
+        this.instance = instance;
+        this.instance.exports._start();
+        this.loop();
+
+        if (this.instance.exports.wioJoystick !== undefined) {
+            addEventListener("gamepadconnected", (event) => {
+                this.gamepads = navigator.getGamepads();
+                this.instance.exports.wioJoystick(event.gamepad.index);
+            });
+        }
+    }
+
+    loop() {
+        for (const id of this.draw_available_windows) {
+            this.instance.exports.wioEvent(this.objects[id].data, 5);
+        }
+        if (this.instance.exports.wioLoop()) {
+            requestAnimationFrame(() => this.loop());
+        }
+    }
+
+    getString(ptr, len) {
+        return new TextDecoder().decode(new Uint8Array(this.memory.buffer, ptr, len).slice());
+    }
+
+    pushObject(object) {
+        const index = this.objects.indexOf(null);
+        if (index !== -1) {
+            this.objects[index] = object;
+            return index;
+        } else {
+            return this.objects.push(object) - 1;
+        }
+    }
+
+    updateModifiers(data, event) {
+        const modifiers = (event.ctrlKey | event.shiftKey << 1 | event.altKey << 2 | event.metaKey << 3);
+        if (modifiers != this.modifiers) {
+            this.modifiers = modifiers;
+            this.instance.exports.wioEvent(data, 11, this.modifiers);
+        }
+    }
+
+    imports = {
+        write: (ptr, len) => {
+            this.buffer += this.getString(ptr, len);
+        },
+
+        flush: () => {
+            console.log(this.buffer);
+            this.buffer = "";
+        },
+
+        messageBox: (ptr, len) => {
+            alert(this.getString(ptr, len));
+        },
+
+        openUri: (ptr, len) => {
+            open(this.getString(ptr, len));
+        },
+
+        createWindow: (data) => {
+            const canvas = this.canvases.shift();
+            if (canvas === undefined) throw new Error("no canvas available");
+
+            const wioEvent = this.instance.exports.wioEvent;
+
+            const input = document.createElement("input");
+            input.tabIndex = -1;
+            input.style.display = "none";
+            input.style.opacity = "0";
+            input.style.position = "absolute";
+            input.style.border = "0px";
+            input.style.padding = "0px";
+            input.addEventListener("input", (event) => {
+                switch (event.inputType) {
+                    case "insertText":
+                    case "insertCompositionText":
+                    case "insertFromPaste":
+                    case "insertFromPasteAsQuotation":
+                    case "insertFromDrop":
+                    case "insertTranspose":
+                    case "insertReplacementText":
+                    case "insertFromYank":
+                        if (event.inputType === "insertCompositionText") {
+                            wioEvent(data, 13);
+                        }
+                        for (const char of event.data) {
+                            wioEvent(data, (event.isComposing ? 14 : 12), char.codePointAt(0));
+                        }
+                        if (!event.isComposing) {
+                            input.value = "";
+                        }
+                        break;
+                }
+            });
+            input.addEventListener("keydown", (event) => canvas.dispatchEvent(new KeyboardEvent("keydown", event)));
+            input.addEventListener("keyup", (event) => canvas.dispatchEvent(new KeyboardEvent("keyup", event)));
+            canvas.parentElement.appendChild(input);
+
+            const window = {
+                canvas: canvas,
+                input: input,
+                data: data,
+                text: false,
+                relative_mouse: false,
+                relative_mouse_unadjusted: false,
+                cursor: "default",
+                drop_files: [],
+                drop_text: null,
+            };
+
+            new ResizeObserver(() => {
+                if (canvas.style.width === "" || canvas.style.width === "") {
+                    const style = getComputedStyle(canvas);
+                    canvas.style.width = style.width;
+                    canvas.style.height = style.height;
+                }
+                canvas.width = canvas.scrollWidth * devicePixelRatio;
+                canvas.height = canvas.scrollHeight * devicePixelRatio;
+                wioEvent(data, 6, (document.fullscreenElement === canvas) ? 2 : 0);
+                wioEvent(data, 8, canvas.scrollWidth, canvas.scrollHeight);
+                wioEvent(data, 9, canvas.width, canvas.height);
+                wioEvent(data, 10, 0, 0, devicePixelRatio)
+                wioEvent(data, 5);
+            }).observe(canvas);
+            canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+            canvas.addEventListener("focus", () => {
+                wioEvent(data, 1);
+                if (window.text) {
+                    input.focus();
+                }
+            });
+            canvas.addEventListener("blur", () => {
+                if (!window.text) {
+                    wioEvent(data, 2);
+                }
+            });
+            canvas.addEventListener("keydown", (event) => {
+                event.preventDefault();
+                const key = Wio.keys[event.code];
+                if (key) wioEvent(data, event.repeat ? 17 : 16, key);
+                this.updateModifiers(data, event);
+            });
+            canvas.addEventListener("keyup", (event) => {
+                const key = Wio.keys[event.code];
+                if (key) wioEvent(data, 18, key);
+                this.updateModifiers(data, event);
+            });
+            canvas.addEventListener("mousedown", (event) => {
+                const button = Wio.buttons[event.button];
+                if (button !== undefined) wioEvent(data, 16, button);
+                if (window.relative_mouse) canvas.requestPointerLock({ unadjustedMovement: window.relative_mouse_unadjusted });
+                this.updateModifiers(data, event);
+            });
+            canvas.addEventListener("mouseup", (event) => {
+                const button = Wio.buttons[event.button];
+                if (button !== undefined) wioEvent(data, 18, button);
+            });
+            canvas.addEventListener("mousemove", (event) => {
+                if (!window.relative_mouse) {
+                    wioEvent(data, 19, event.offsetX, event.offsetY);
+                } else {
+                    wioEvent(data, 20, event.movementX, event.movementY);
+                }
+                this.updateModifiers(data, event);
+            });
+            canvas.addEventListener("mouseleave", () => wioEvent(data, 21));
+            canvas.addEventListener("wheel", (event) => {
+                if (event.deltaY !== 0) wioEvent(data, 22, 0, 0, event.deltaY);
+                if (event.deltaX !== 0) wioEvent(data, 23, 0, 0, event.deltaX);
+            });
+            canvas.addEventListener("dragenter", (event) => {
+                event.preventDefault();
+                window.drop_files = [];
+                window.drop_text = null;
+                wioEvent(data, 29);
+            });
+            canvas.addEventListener("dragover", (event) => {
+                event.preventDefault();
+                wioEvent(data, 30, event.offsetX, event.offsetY);
+            });
+            canvas.addEventListener("drop", (event) => {
+                event.preventDefault();
+                for (const file of event.dataTransfer.files) {
+                    window.drop_files.push(file.name);
+                }
+                const text = event.dataTransfer.getData("text/plain");
+                window.drop_text = text.length > 0 ? text : null;
+                wioEvent(data, 31);
+            });
+
+            return this.pushObject(window);
+        },
+
+        enableTextInput: (id, x, y) => {
+            this.objects[id].text = true;
+            const rect = this.objects[id].canvas.getBoundingClientRect();
+            this.objects[id].input.style.left = `${rect.x + x}px`;
+            this.objects[id].input.style.top = `${rect.y + y}px`;
+            this.objects[id].input.style.display = "unset";
+            if (document.activeElement === this.objects[id].canvas) {
+                this.objects[id].input.focus();
+            }
+        },
+
+        disableTextInput: (id) => {
+            this.objects[id].text = false;
+            this.objects[id].input.style.display = "none";
+            if (document.activeElement === this.objects[id].input) {
+                this.objects[id].canvas.focus();
+            }
+        },
+
+        enableRelativeMouse: (id, unadjusted) => {
+            this.objects[id].relative_mouse = true;
+            this.objects[id].relative_mouse_unadjusted = unadjusted;
+            this.objects[id].canvas.requestPointerLock({ unadjustedMovement: unadjusted });
+        },
+
+        disableRelativeMouse: (id) => {
+            this.objects[id].relative_mouse = false;
+            document.exitPointerLock();
+        },
+
+        enableDrawAvailableEvents: (id) => {
+            if (this.draw_available_windows.indexOf(id) == -1) {
+                this.draw_available_windows.push(id);
+            }
+        },
+
+        disableDrawAvailableEvents: (id) => {
+            const index = this.draw_available_windows.indexOf(id);
+            if (index != -1) {
+                this.draw_available_windows.splice(index, 1);
+            }
+        },
+
+        setFullscreen: (id, fullscreen) => {
+            if (fullscreen) {
+                this.objects[id].canvas.requestFullscreen().catch(() => { });
+            } else {
+                document.exitFullscreen().catch(() => { });
+            }
+        },
+
+        setSize: (id, width, height) => {
+            this.objects[id].canvas.style.width = `${width}px`;
+            this.objects[id].canvas.style.height = `${height}px`;
+        },
+
+        setCursor: (id, cursor) => {
+            this.objects[id].cursor = {
+                0: "default",
+                1: "none",
+                2: "context-menu",
+                3: "help",
+                4: "pointer",
+                5: "progress",
+                6: "wait",
+                7: "cell",
+                8: "crosshair",
+                9: "text",
+                10: "vertical-text",
+                11: "alias",
+                12: "copy",
+                13: "move",
+                14: "no-drop",
+                15: "not-allowed",
+                16: "grab",
+                17: "grabbing",
+                18: "e-resize",
+                19: "n-resize",
+                20: "ne-resize",
+                21: "nw-resize",
+                22: "s-resize",
+                23: "se-resize",
+                24: "sw-resize",
+                25: "w-resize",
+                26: "ew-resize",
+                27: "ns-resize",
+                28: "nesw-resize",
+                29: "nwse-resize",
+                30: "col-resize",
+                31: "row-resize",
+                32: "all-scroll",
+                33: "zoom-in",
+                34: "zoom-out",
+            }[cursor];
+
+            this.objects[id].canvas.style.cursor = this.objects[id].cursor;
+        },
+
+        setClipboardText: (ptr, len) => {
+            navigator.clipboard.writeText(this.getString(ptr, len)).catch(() => { })
+        },
+
+        presentFramebuffer: (id, ptr, width, height) => {
+            const framebuffer = new Uint8ClampedArray(this.memory.buffer, ptr, width * height * 4);
+            const image = new ImageData(framebuffer, width, height);
+            this.objects[id].canvas.getContext("2d").putImageData(image, 0, 0);
+        },
+
+        getDropFileCount: (id) => this.objects[id].drop_files.length,
+
+        getDropFileLen: (id, index) => new TextEncoder().encode(this.objects[id].drop_files[index]).length,
+
+        getDropFile: (id, index, ptr) => {
+            new Uint8Array(this.memory.buffer, ptr).set(new TextEncoder().encode(this.objects[id].drop_files[index]));
+        },
+
+        getDropTextLen: (id) => {
+            const text = this.objects[id].drop_text;
+            return text !== null ? new TextEncoder().encode(text).length : 0;
+        },
+
+        getDropText: (id, ptr) => {
+            new Uint8Array(this.memory.buffer, ptr).set(new TextEncoder().encode(this.objects[id].drop_text));
+        },
+
+        getJoystickCount: () => this.gamepads.length,
+
+        getJoystickIdLen: (i) => {
+            return (this.gamepads[i] !== null) ? new TextEncoder().encode(this.gamepads[i].id).length : 0;
+        },
+
+        getJoystickId: (i, ptr) => {
+            new Uint8Array(this.memory.buffer, ptr).set(new TextEncoder().encode(this.gamepads[i].id));
+        },
+
+        openJoystick: (i, ptr) => {
+            if (this.gamepads[i] === null || !this.gamepads[i].connected) return false;
+            const lengths = new Uint32Array(this.memory.buffer, ptr, 2);
+            lengths[0] = this.gamepads[i].axes.length;
+            lengths[1] = this.gamepads[i].buttons.length;
+            return true;
+        },
+
+        getJoystickState: (index, axes_ptr, axes_len, buttons_ptr, buttons_len) => {
+            if (this.gamepads[index] === null || !this.gamepads[index].connected) return false;
+            const axes = new Uint16Array(this.memory.buffer, axes_ptr, axes_len);
+            const buttons = new Uint8Array(this.memory.buffer, buttons_ptr, buttons_len);
+            for (let i = 0; i < axes_len; i++) {
+                axes[i] = (this.gamepads[index].axes[i] + 1) * 32767.5;
+            }
+            for (let i = 0; i < buttons_len; i++) {
+                buttons[i] = this.gamepads[index].buttons[i].pressed;
+            }
+            return true;
+        },
+
+        openAudioOutput: (writeFn, buffer, sample_rate, channels) => {
+            const context = new AudioContext({ sampleRate: sample_rate });
+            context.audioWorklet.addModule(new URL("WioAudio.js", import.meta.url)).then(() => {
+                const node = new AudioWorkletNode(context, "wio", {
+                    numberOfInputs: 0,
+                    outputChannelCount: [channels],
+                });
+                node.port.postMessage({
+                    memory: this.memory,
+                    module: this.module,
+                    callback: writeFn,
+                    buffer: buffer,
+                    channels: channels,
+                });
+                node.connect(context.destination);
+                document.addEventListener("click", () => { if (context.state === "suspended") { context.resume(); } }, { once: true });
+                return node;
+            });
+            return this.pushObject(context);
+        },
+
+        openAudioInput: (readFn, buffer, sample_rate, channels) => {
+            const context = new AudioContext({ sampleRate: sample_rate });
+            navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+                context.audioWorklet.addModule(new URL("WioAudio.js", import.meta.url)).then(() => {
+                    const node = new AudioWorkletNode(context, "wio", { numberOfOutputs: 0 });
+                    node.port.postMessage({
+                        memory: this.memory,
+                        module: this.module,
+                        callback: readFn,
+                        buffer: buffer,
+                        channels: channels,
+                    });
+                    const source = context.createMediaStreamSource(stream);
+                    source.connect(node);
+                });
+            });
+            return this.pushObject(context);
+        },
+
+        closeAudioContext: (id) => {
+            this.objects[id].close();
+            this.objects[id] = null;
+        },
+    };
+
+    static keys = {
+        KeyA: 5,
+        KeyB: 6,
+        KeyC: 7,
+        KeyD: 8,
+        KeyE: 9,
+        KeyF: 10,
+        KeyG: 11,
+        KeyH: 12,
+        KeyI: 13,
+        KeyJ: 14,
+        KeyK: 15,
+        KeyL: 16,
+        KeyM: 17,
+        KeyN: 18,
+        KeyO: 19,
+        KeyP: 20,
+        KeyQ: 21,
+        KeyR: 22,
+        KeyS: 23,
+        KeyT: 24,
+        KeyU: 25,
+        KeyV: 26,
+        KeyW: 27,
+        KeyX: 28,
+        KeyY: 29,
+        KeyZ: 30,
+        Digit1: 31,
+        Digit2: 32,
+        Digit3: 33,
+        Digit4: 34,
+        Digit5: 35,
+        Digit6: 36,
+        Digit7: 37,
+        Digit8: 38,
+        Digit9: 39,
+        Digit0: 40,
+        Enter: 41,
+        Escape: 42,
+        Backspace: 43,
+        Tab: 44,
+        Space: 45,
+        Minus: 46,
+        Equal: 47,
+        BracketLeft: 48,
+        BracketRight: 49,
+        Backslash: 50,
+        Semicolon: 51,
+        Quote: 52,
+        Backquote: 53,
+        Comma: 54,
+        Period: 55,
+        Slash: 56,
+        CapsLock: 57,
+        F1: 58,
+        F2: 59,
+        F3: 60,
+        F4: 61,
+        F5: 62,
+        F6: 63,
+        F7: 64,
+        F8: 65,
+        F9: 66,
+        F10: 67,
+        F11: 68,
+        F12: 69,
+        PrintScreen: 70,
+        ScrollLock: 71,
+        Pause: 72,
+        Insert: 73,
+        Home: 74,
+        PageUp: 75,
+        Delete: 76,
+        End: 77,
+        PageDown: 78,
+        ArrowRight: 79,
+        ArrowLeft: 80,
+        ArrowDown: 81,
+        ArrowUp: 82,
+        NumLock: 83,
+        NumpadDivide: 84,
+        NumpadMultiply: 85,
+        NumpadSubtract: 86,
+        NumpadAdd: 87,
+        NumpadEnter: 88,
+        Numpad1: 89,
+        Numpad2: 90,
+        Numpad3: 91,
+        Numpad4: 92,
+        Numpad5: 93,
+        Numpad6: 94,
+        Numpad7: 95,
+        Numpad8: 96,
+        Numpad9: 97,
+        Numpad0: 98,
+        NumpadDecimal: 99,
+        IntlBackslash: 100,
+        ContextMenu: 101,
+        NumpadEqual: 102,
+        F13: 103,
+        F14: 104,
+        F15: 105,
+        F16: 106,
+        F17: 107,
+        F18: 108,
+        F19: 109,
+        F20: 110,
+        F21: 111,
+        F22: 112,
+        F23: 113,
+        F24: 114,
+        NumpadComma: 115,
+        IntlRo: 116,
+        KanaMode: 117,
+        IntlYen: 118,
+        Convert: 119,
+        NonConvert: 120,
+        Lang1: 121,
+        Lang2: 122,
+        ControlLeft: 123,
+        ShiftLeft: 124,
+        AltLeft: 125,
+        MetaLeft: 126,
+        ControlRight: 127,
+        ShiftRight: 128,
+        AltRight: 129,
+        MetaRight: 130,
+    };
+
+    static buttons = {
+        0: 0,
+        1: 2,
+        2: 1,
+        3: 3,
+        4: 4,
+    };
+}
+
+export default Wio;

@@ -1,0 +1,29 @@
+.{
+    .name = .wio,
+    .version = "0.0.0",
+    .fingerprint = 0xc7cd0be0afeb11f3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .win32 = .{
+            .url = "https://github.com/ypsvlq/win32/archive/5edca53ffbd415e19170f022932d5b7063e2cccf.tar.gz",
+            .hash = "win32-0.0.0-4XUuba3r_gIzIdDxDJM72L90Kf4kTUI1mAqYjE-llhAZ",
+            .lazy = true,
+        },
+        .wio_macos_sdk = .{
+            .url = "https://github.com/ypsvlq/wio-macos-sdk/archive/1014fff9b544bf80200a2a9a92af257451286913.tar.gz",
+            .hash = "wio_macos_sdk-15.5.0-Q4Y7wxqRsAE1ifcDVRYPyFChElssvep3qd5-A_fPS5Jp",
+            .lazy = true,
+        },
+        .wio_unix_headers = .{
+            .url = "https://github.com/ypsvlq/wio-unix-headers/archive/3bd227608c8fc7e4cd8547e43966b60f81c4caf3.tar.gz",
+            .hash = "wio_unix_headers-0.0.0-seffXF_FQQC9vaRGpzc1-w6M8YktDc2qzlOgItxv6kWO",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE.txt",
+    },
+}

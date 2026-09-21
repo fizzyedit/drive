@@ -1,0 +1,385 @@
+const std = @import("std");
+const build_options = @import("build_options");
+const h = @import("c");
+const wio = @import("../../wio.zig");
+const internal = @import("../../wio.internal.zig");
+const DynLib = @import("../DynLib.zig");
+const log = std.log.scoped(.wio);
+
+var imports: extern struct {
+    pa_threaded_mainloop_new: *const fn () callconv(.c) ?*h.pa_threaded_mainloop,
+    pa_threaded_mainloop_free: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) void,
+    pa_threaded_mainloop_start: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) c_int,
+    pa_threaded_mainloop_stop: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) void,
+    pa_threaded_mainloop_get_api: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) [*c]h.pa_mainloop_api,
+    pa_threaded_mainloop_lock: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) void,
+    pa_threaded_mainloop_unlock: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) void,
+    pa_threaded_mainloop_wait: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) void,
+    pa_threaded_mainloop_signal: *const fn (m: ?*h.pa_threaded_mainloop, wait_for_accept: c_int) callconv(.c) void,
+    pa_threaded_mainloop_accept: *const fn (m: ?*h.pa_threaded_mainloop) callconv(.c) void,
+    pa_context_new: *const fn (mainloop: [*c]h.pa_mainloop_api, name: [*c]const u8) callconv(.c) ?*h.pa_context,
+    pa_context_unref: *const fn (c: ?*h.pa_context) callconv(.c) void,
+    pa_context_connect: *const fn (c: ?*h.pa_context, server: [*c]const u8, flags: h.pa_context_flags_t, api: [*c]const h.pa_spawn_api) callconv(.c) c_int,
+    pa_context_disconnect: *const fn (c: ?*h.pa_context) callconv(.c) void,
+    pa_context_errno: *const fn (c: ?*const h.pa_context) callconv(.c) c_int,
+    pa_context_set_state_callback: *const fn (c: ?*h.pa_context, cb: h.pa_context_notify_cb_t, userdata: ?*anyopaque) callconv(.c) void,
+    pa_context_get_state: *const fn (c: ?*const h.pa_context) callconv(.c) h.pa_context_state_t,
+    pa_context_set_subscribe_callback: *const fn (c: ?*h.pa_context, cb: h.pa_context_subscribe_cb_t, userdata: ?*anyopaque) callconv(.c) void,
+    pa_context_subscribe: *const fn (c: ?*h.pa_context, m: h.pa_subscription_mask_t, cb: h.pa_context_success_cb_t, userdata: ?*anyopaque) callconv(.c) ?*h.pa_operation,
+    pa_context_get_server_info: *const fn (c: ?*h.pa_context, cb: h.pa_server_info_cb_t, userdata: ?*anyopaque) callconv(.c) ?*h.pa_operation,
+    pa_context_get_sink_info_by_name: *const fn (c: ?*h.pa_context, name: [*c]const u8, cb: h.pa_sink_info_cb_t, userdata: ?*anyopaque) callconv(.c) ?*h.pa_operation,
+    pa_context_get_source_info_by_name: *const fn (c: ?*h.pa_context, name: [*c]const u8, cb: h.pa_source_info_cb_t, userdata: ?*anyopaque) callconv(.c) ?*h.pa_operation,
+    pa_context_get_sink_info_list: *const fn (c: ?*h.pa_context, cb: h.pa_sink_info_cb_t, userdata: ?*anyopaque) callconv(.c) ?*h.pa_operation,
+    pa_context_get_source_info_list: *const fn (c: ?*h.pa_context, cb: h.pa_source_info_cb_t, userdata: ?*anyopaque) callconv(.c) ?*h.pa_operation,
+    pa_strerror: *const fn (@"error": c_int) callconv(.c) [*c]const u8,
+    pa_operation_unref: *const fn (o: ?*h.pa_operation) callconv(.c) void,
+    pa_operation_get_state: *const fn (o: ?*const h.pa_operation) callconv(.c) h.pa_operation_state_t,
+    pa_channel_map_init_auto: *const fn (m: [*c]h.pa_channel_map, channels: c_uint, def: h.pa_channel_map_def_t) callconv(.c) [*c]h.pa_channel_map,
+    pa_stream_new: *const fn (c: ?*h.pa_context, name: [*c]const u8, ss: [*c]const h.pa_sample_spec, map: [*c]const h.pa_channel_map) callconv(.c) ?*h.pa_stream,
+    pa_stream_unref: *const fn (s: ?*h.pa_stream) callconv(.c) void,
+    pa_stream_connect_playback: *const fn (s: ?*h.pa_stream, dev: [*c]const u8, attr: [*c]const h.pa_buffer_attr, flags: h.pa_stream_flags_t, volume: [*c]const h.pa_cvolume, sync_stream: ?*h.pa_stream) callconv(.c) c_int,
+    pa_stream_connect_record: *const fn (s: ?*h.pa_stream, dev: [*c]const u8, attr: [*c]const h.pa_buffer_attr, flags: h.pa_stream_flags_t) callconv(.c) c_int,
+    pa_stream_disconnect: *const fn (s: ?*h.pa_stream) callconv(.c) c_int,
+    pa_stream_set_write_callback: *const fn (p: ?*h.pa_stream, cb: h.pa_stream_request_cb_t, userdata: ?*anyopaque) callconv(.c) void,
+    pa_stream_set_read_callback: *const fn (p: ?*h.pa_stream, cb: h.pa_stream_request_cb_t, userdata: ?*anyopaque) callconv(.c) void,
+    pa_stream_begin_write: *const fn (p: ?*h.pa_stream, data: [*c]?*anyopaque, nbytes: [*c]usize) callconv(.c) c_int,
+    pa_stream_write: *const fn (p: ?*h.pa_stream, data: ?*const anyopaque, nbytes: usize, free_cb: h.pa_free_cb_t, offset: i64, seek: h.pa_seek_mode_t) callconv(.c) c_int,
+    pa_stream_peek: *const fn (p: ?*h.pa_stream, data: [*c]?*const anyopaque, nbytes: [*c]usize) callconv(.c) c_int,
+    pa_stream_drop: *const fn (p: ?*h.pa_stream) callconv(.c) c_int,
+} = undefined;
+const c = if (build_options.system_integration) h else &imports;
+
+var libpulse: DynLib = undefined;
+var loop: *h.pa_threaded_mainloop = undefined;
+var context: *h.pa_context = undefined;
+
+var defaultOutputFn: ?*const fn (wio.AudioDevice) void = null;
+var defaultInputFn: ?*const fn (wio.AudioDevice) void = null;
+
+pub fn init(options: wio.InitOptions) !void {
+    defaultOutputFn = options.audioDefaultOutputFn;
+    defaultInputFn = options.audioDefaultInputFn;
+
+    try DynLib.load(&imports, &.{.{ .handle = &libpulse, .name = "libpulse.so.0" }});
+    errdefer libpulse.close();
+
+    loop = c.pa_threaded_mainloop_new() orelse return internal.logUnexpected("pa_threaded_mainloop_new");
+    errdefer c.pa_threaded_mainloop_free(loop);
+
+    const api = c.pa_threaded_mainloop_get_api(loop);
+    context = c.pa_context_new(api, null) orelse return internal.logUnexpected("pa_context_new");
+    errdefer c.pa_context_unref(context);
+
+    c.pa_context_set_state_callback(context, notifyCallback, null);
+    if (c.pa_context_connect(context, null, h.PA_CONTEXT_NOFLAGS, null) < 0) return logContextError("pa_context_connect");
+
+    c.pa_threaded_mainloop_lock(loop);
+    defer c.pa_threaded_mainloop_unlock(loop);
+
+    if (c.pa_threaded_mainloop_start(loop) < 0) return internal.logUnexpected("pa_threaded_mainloop_start");
+    errdefer c.pa_threaded_mainloop_stop(loop);
+
+    while (true) {
+        switch (c.pa_context_get_state(context)) {
+            h.PA_CONTEXT_READY => break,
+            h.PA_CONTEXT_FAILED => return logContextError("pa_context_connect"),
+            else => c.pa_threaded_mainloop_wait(loop),
+        }
+    }
+
+    if (defaultOutputFn != null or defaultInputFn != null) {
+        c.pa_context_set_subscribe_callback(context, subscribeCallback, null);
+        const operation = c.pa_context_subscribe(context, h.PA_SUBSCRIPTION_MASK_SERVER, successCallback, null);
+        defer c.pa_operation_unref(operation);
+        while (c.pa_operation_get_state(operation) == h.PA_OPERATION_RUNNING) c.pa_threaded_mainloop_wait(loop);
+    }
+}
+
+pub fn deinit() void {
+    internal.allocator.free(last_default_source);
+    internal.allocator.free(last_default_sink);
+    c.pa_threaded_mainloop_lock(loop);
+    c.pa_context_disconnect(context);
+    c.pa_context_unref(context);
+    c.pa_threaded_mainloop_unlock(loop);
+    c.pa_threaded_mainloop_stop(loop);
+    c.pa_threaded_mainloop_free(loop);
+    libpulse.close();
+}
+
+var server_info_changed: bool = true;
+var last_default_sink: []const u8 = "";
+var last_default_source: []const u8 = "";
+
+pub fn update() void {
+    if (defaultOutputFn != null or defaultInputFn != null) {
+        if (server_info_changed) {
+            var sink: bool = false;
+            var source: bool = false;
+            {
+                c.pa_threaded_mainloop_lock(loop);
+                defer c.pa_threaded_mainloop_unlock(loop);
+
+                server_info_changed = false;
+
+                var maybe_info: ?*const h.pa_server_info = null;
+                const operation = c.pa_context_get_server_info(context, serverInfoCallback, @ptrCast(&maybe_info));
+                defer c.pa_operation_unref(operation);
+                while (c.pa_operation_get_state(operation) == h.PA_OPERATION_RUNNING and maybe_info == null) c.pa_threaded_mainloop_wait(loop);
+                defer c.pa_threaded_mainloop_accept(loop);
+
+                if (maybe_info) |info| {
+                    if (defaultOutputFn != null) {
+                        const default_sink = std.mem.sliceTo(info.default_sink_name, 0);
+                        if (!std.mem.eql(u8, default_sink, last_default_sink)) {
+                            internal.allocator.free(last_default_sink);
+                            last_default_sink = internal.allocator.dupe(u8, default_sink) catch "";
+                            sink = true;
+                        }
+                    }
+                    if (defaultInputFn != null) {
+                        const default_source = std.mem.sliceTo(info.default_source_name, 0);
+                        if (!std.mem.eql(u8, default_source, last_default_source)) {
+                            internal.allocator.free(last_default_source);
+                            last_default_source = internal.allocator.dupe(u8, default_source) catch "";
+                            source = true;
+                        }
+                    }
+                }
+            }
+
+            if (defaultOutputFn) |callback| {
+                if (sink) {
+                    if (internal.allocator.dupeSentinel(u8, last_default_sink, 0)) |id| {
+                        callback(.{ .backend = .{ .id = id, .type = .output } });
+                    } else |_| {}
+                }
+            }
+            if (defaultInputFn) |callback| {
+                if (source) {
+                    if (internal.allocator.dupeSentinel(u8, last_default_source, 0)) |id| {
+                        callback(.{ .backend = .{ .id = id, .type = .input } });
+                    } else |_| {}
+                }
+            }
+        }
+    }
+}
+
+pub const AudioDeviceIterator = struct {
+    list: std.ArrayList(AudioDevice) = .empty,
+    index: usize = 0,
+
+    pub fn init(mode: wio.AudioDeviceType) AudioDeviceIterator {
+        var self = AudioDeviceIterator{};
+        c.pa_threaded_mainloop_lock(loop);
+        defer c.pa_threaded_mainloop_unlock(loop);
+        const operation = if (mode == .output)
+            c.pa_context_get_sink_info_list(context, sinkListCallback, &self.list)
+        else
+            c.pa_context_get_source_info_list(context, sourceListCallback, &self.list);
+        defer c.pa_operation_unref(operation);
+        while (c.pa_operation_get_state(operation) == h.PA_OPERATION_RUNNING) c.pa_threaded_mainloop_wait(loop);
+        return self;
+    }
+
+    pub fn deinit(self: *AudioDeviceIterator) void {
+        self.list.deinit(internal.allocator);
+    }
+
+    pub fn next(self: *AudioDeviceIterator) ?AudioDevice {
+        if (self.index == self.list.items.len) return null;
+        const device = self.list.items[self.index];
+        self.index += 1;
+        return device;
+    }
+};
+
+pub const AudioDevice = struct {
+    id: [:0]const u8,
+    type: wio.AudioDeviceType,
+
+    pub fn release(self: AudioDevice) void {
+        internal.allocator.free(self.id);
+    }
+
+    pub fn openOutput(self: AudioDevice, writeFn: *const fn ([]f32) void, format: wio.AudioFormat) !AudioOutput {
+        c.pa_threaded_mainloop_lock(loop);
+        defer c.pa_threaded_mainloop_unlock(loop);
+
+        const stream = try openStream(format);
+        errdefer c.pa_stream_unref(stream);
+        c.pa_stream_set_write_callback(stream, AudioOutput.callback, @constCast(writeFn));
+
+        const attr = h.pa_buffer_attr{
+            .maxlength = std.math.maxInt(u32),
+            .tlength = 1,
+            .prebuf = std.math.maxInt(u32),
+            .minreq = std.math.maxInt(u32),
+            .fragsize = std.math.maxInt(u32),
+        };
+        if (c.pa_stream_connect_playback(stream, self.id, &attr, h.PA_STREAM_ADJUST_LATENCY, null, null) != 0) return logContextError("pa_stream_connect_playback");
+
+        return .{ .stream = stream };
+    }
+
+    pub fn openInput(self: AudioDevice, readFn: *const fn ([]const f32) void, format: wio.AudioFormat) !AudioInput {
+        c.pa_threaded_mainloop_lock(loop);
+        defer c.pa_threaded_mainloop_unlock(loop);
+
+        const stream = try openStream(format);
+        errdefer c.pa_stream_unref(stream);
+        c.pa_stream_set_read_callback(stream, AudioInput.callback, @constCast(readFn));
+
+        const attr = h.pa_buffer_attr{
+            .maxlength = std.math.maxInt(u32),
+            .tlength = std.math.maxInt(u32),
+            .prebuf = std.math.maxInt(u32),
+            .minreq = std.math.maxInt(u32),
+            .fragsize = 1,
+        };
+        if (c.pa_stream_connect_record(stream, self.id, &attr, h.PA_STREAM_ADJUST_LATENCY) != 0) return logContextError("pa_stream_connect_record");
+
+        return .{ .stream = stream };
+    }
+
+    pub fn getId(self: AudioDevice, allocator: std.mem.Allocator) ![]u8 {
+        return allocator.dupe(u8, self.id);
+    }
+
+    pub fn getName(self: AudioDevice, allocator: std.mem.Allocator) ![]u8 {
+        c.pa_threaded_mainloop_lock(loop);
+        defer c.pa_threaded_mainloop_unlock(loop);
+
+        var maybe_name: ?[*:0]const u8 = null;
+
+        const operation = if (self.type == .output)
+            c.pa_context_get_sink_info_by_name(context, self.id, sinkNameCallback, @ptrCast(&maybe_name))
+        else
+            c.pa_context_get_source_info_by_name(context, self.id, sourceNameCallback, @ptrCast(&maybe_name));
+        defer c.pa_operation_unref(operation);
+        while (c.pa_operation_get_state(operation) == h.PA_OPERATION_RUNNING and maybe_name == null) c.pa_threaded_mainloop_wait(loop);
+
+        defer c.pa_threaded_mainloop_accept(loop);
+        return if (maybe_name) |name| allocator.dupe(u8, std.mem.sliceTo(name, 0)) else "";
+    }
+};
+
+fn openStream(format: wio.AudioFormat) !*h.pa_stream {
+    var map: h.pa_channel_map = undefined;
+    _ = c.pa_channel_map_init_auto(&map, format.channels, h.PA_CHANNEL_MAP_DEFAULT) orelse return internal.logUnexpected("pa_channel_map_init_auto");
+    return c.pa_stream_new(context, "", &.{ .format = h.PA_SAMPLE_FLOAT32LE, .rate = format.sample_rate, .channels = map.channels }, &map) orelse logContextError("pa_stream_new");
+}
+
+pub const AudioOutput = struct {
+    stream: *h.pa_stream,
+
+    pub fn close(self: *AudioOutput) void {
+        c.pa_threaded_mainloop_lock(loop);
+        defer c.pa_threaded_mainloop_unlock(loop);
+        _ = c.pa_stream_disconnect(self.stream);
+        c.pa_stream_unref(self.stream);
+    }
+
+    fn callback(stream: ?*h.pa_stream, _: usize, data: ?*anyopaque) callconv(.c) void {
+        const writeFn: *const fn ([]f32) void = @ptrCast(@alignCast(data));
+        var ptr: ?*anyopaque = undefined;
+        var nbytes: usize = std.math.maxInt(usize);
+        if (c.pa_stream_begin_write(stream, &ptr, &nbytes) == 0 and ptr != null) {
+            const buffer: [*]f32 = @ptrCast(@alignCast(ptr));
+            writeFn(buffer[0 .. nbytes / @sizeOf(f32)]);
+            _ = c.pa_stream_write(stream, ptr, nbytes, null, 0, h.PA_SEEK_RELATIVE);
+        }
+    }
+};
+
+pub const AudioInput = struct {
+    stream: *h.pa_stream,
+
+    pub fn close(self: *AudioInput) void {
+        c.pa_threaded_mainloop_lock(loop);
+        defer c.pa_threaded_mainloop_unlock(loop);
+        _ = c.pa_stream_disconnect(self.stream);
+        c.pa_stream_unref(self.stream);
+    }
+
+    fn callback(stream: ?*h.pa_stream, _: usize, data: ?*anyopaque) callconv(.c) void {
+        const readFn: *const fn ([]const f32) void = @ptrCast(@alignCast(data));
+        var ptr: ?*const anyopaque = null;
+        var nbytes: usize = 0;
+        if (c.pa_stream_peek(stream, &ptr, &nbytes) == 0 and ptr != null) {
+            const buffer: [*]const f32 = @ptrCast(@alignCast(ptr));
+            readFn(buffer[0 .. nbytes / @sizeOf(f32)]);
+        }
+        if (nbytes != 0) _ = c.pa_stream_drop(stream);
+    }
+};
+
+fn logContextError(name: []const u8) error{Unexpected} {
+    log.err("{s} failed: {s}", .{ name, c.pa_strerror(c.pa_context_errno(context)) });
+    return error.Unexpected;
+}
+
+fn notifyCallback(_: ?*h.pa_context, _: ?*anyopaque) callconv(.c) void {
+    c.pa_threaded_mainloop_signal(loop, 0);
+}
+
+fn subscribeCallback(_: ?*h.pa_context, _: h.pa_subscription_event_type_t, _: u32, _: ?*anyopaque) callconv(.c) void {
+    server_info_changed = true;
+}
+
+fn successCallback(_: ?*h.pa_context, _: c_int, _: ?*anyopaque) callconv(.c) void {
+    c.pa_threaded_mainloop_signal(loop, 0);
+}
+
+fn serverInfoCallback(_: ?*h.pa_context, info: ?*const h.pa_server_info, data: ?*anyopaque) callconv(.c) void {
+    const result: *?*const h.pa_server_info = @ptrCast(@alignCast(data));
+    result.* = info;
+    c.pa_threaded_mainloop_signal(loop, 1);
+}
+
+fn sinkNameCallback(_: ?*h.pa_context, info: ?*const h.pa_sink_info, eol: c_int, data: ?*anyopaque) callconv(.c) void {
+    const result: *?[*:0]const u8 = @ptrCast(@alignCast(data));
+    if (eol == 0) {
+        result.* = info.?.description;
+        c.pa_threaded_mainloop_signal(loop, 1);
+    } else {
+        c.pa_threaded_mainloop_signal(loop, 0);
+    }
+}
+
+fn sourceNameCallback(_: ?*h.pa_context, info: ?*const h.pa_source_info, eol: c_int, data: ?*anyopaque) callconv(.c) void {
+    const result: *?[*:0]const u8 = @ptrCast(@alignCast(data));
+    if (eol == 0) {
+        result.* = info.?.description;
+        c.pa_threaded_mainloop_signal(loop, 1);
+    } else {
+        c.pa_threaded_mainloop_signal(loop, 0);
+    }
+}
+
+fn sinkListCallback(_: ?*h.pa_context, info: ?*const h.pa_sink_info, eol: c_int, data: ?*anyopaque) callconv(.c) void {
+    const list: *std.ArrayList(AudioDevice) = @ptrCast(@alignCast(data));
+    if (eol == 0) {
+        const id = internal.allocator.dupeSentinel(u8, std.mem.sliceTo(info.?.name, 0), 0) catch return;
+        list.append(internal.allocator, .{ .id = id, .type = .output }) catch {
+            internal.allocator.free(id);
+            return;
+        };
+    } else {
+        c.pa_threaded_mainloop_signal(loop, 0);
+    }
+}
+
+fn sourceListCallback(_: ?*h.pa_context, info: ?*const h.pa_source_info, eol: c_int, data: ?*anyopaque) callconv(.c) void {
+    const list: *std.ArrayList(AudioDevice) = @ptrCast(@alignCast(data));
+    if (eol == 0) {
+        const id = internal.allocator.dupeSentinel(u8, std.mem.sliceTo(info.?.name, 0), 0) catch return;
+        list.append(internal.allocator, .{ .id = id, .type = .input }) catch {
+            internal.allocator.free(id);
+            return;
+        };
+    } else {
+        c.pa_threaded_mainloop_signal(loop, 0);
+    }
+}

@@ -1,14 +1,21 @@
 .{
-    .name = .zig_drive,
-    .fingerprint = 0x51d62caeaf1fc7ce,
+    .name = .drive,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "plugin.zig",
+        "plugin.zig.zon",
         "src",
         "LICENSE",
         "README.md",
+    },
+    .fingerprint = 0x681df58f0316cd49,
+    .dependencies = .{
+        // Locally the SDK next door; a release pins the `fizzy-sdk-v*` asset URL instead.
+        .fizzy = .{
+            .path = "../../fizzy/sdk",
+        },
     },
 }

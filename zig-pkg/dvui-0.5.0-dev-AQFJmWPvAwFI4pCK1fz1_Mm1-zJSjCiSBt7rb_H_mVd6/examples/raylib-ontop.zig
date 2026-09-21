@@ -1,0 +1,168 @@
+const std = @import("std");
+const dvui = @import("dvui");
+const RaylibBackend = @import("raylib-backend");
+comptime {
+    std.debug.assert(@hasDecl(RaylibBackend, "RaylibBackend"));
+}
+const ray = RaylibBackend.c;
+
+const window_icon_png = @embedFile("zig-favicon.png");
+
+//TODO:
+//Figure out the best way to integrate raylib and dvui Event Handling
+
+pub fn main(init: std.process.Init) !void {
+    if (@import("builtin").os.tag == .windows) { // optional
+        // on windows graphical apps have no console, so output goes to nowhere - attach it manually. related: https://github.com/ziglang/zig/issues/4196
+        try dvui.Backend.Common.windowsAttachConsole();
+    }
+    RaylibBackend.enableRaylibLogging();
+
+    // create OS window directly with raylib
+    ray.SetConfigFlags(ray.FLAG_WINDOW_RESIZABLE);
+    ray.SetConfigFlags(ray.FLAG_WINDOW_HIGHDPI);
+    ray.SetConfigFlags(ray.FLAG_VSYNC_HINT);
+    if (dvui.accesskit_enabled)
+        ray.SetConfigFlags(ray.FLAG_WINDOW_HIDDEN);
+    ray.InitWindow(800, 600, "DVUI Raylib Ontop Example");
+    defer ray.CloseWindow();
+
+    // init Raylib backend
+    // init() means the app owns the window (and must call CloseWindow itself)
+    var backend = RaylibBackend.init(init.io, init.gpa);
+    defer backend.deinit();
+    backend.log_events = true;
+
+    // init dvui Window (maps onto a single OS window)
+    // OS window is managed by raylib, not dvui
+    var win = try dvui.Window.init(@src(), init.gpa, backend.backend(), .{});
+    defer win.deinit();
+
+    var selected_color: dvui.Color = dvui.Color.white;
+
+    while (!ray.WindowShouldClose()) {
+        ray.BeginDrawing();
+
+        // marks the beginning of a frame for dvui, can call dvui functions after this
+        try win.begin(win.backend.nanoTime());
+
+        // send all Raylib events to dvui for processing
+        _ = try backend.addAllEvents(&win);
+
+        if (backend.shouldBlockRaylibInput()) {
+            // NOTE: I am using raygui here because it has a simple lock-unlock system
+            // Non-raygui raylib apps could also easily implement such a system
+            ray.GuiLock();
+        } else {
+            ray.GuiUnlock();
+        }
+        // if dvui widgets might not cover the whole window, then need to clear
+        // the previous frame's render
+        ray.ClearBackground(RaylibBackend.dvuiColorToRaylib(dvui.Color.gray));
+
+        {
+            var b = dvui.box(@src(), .{}, .{ .expand = .horizontal, .margin = .{ .x = 10 } });
+            defer b.deinit();
+
+            if (ray.GuiIsLocked()) {
+                dvui.label(@src(), "Raygui Status: Locked", .{}, .{});
+            } else {
+                dvui.label(@src(), "Raygui Status: Unlocked", .{}, .{});
+            }
+
+            if (dvui.expander(@src(), "Pick Color Using Raygui", .{}, .{})) {
+                colorPicker(&selected_color);
+            }
+        }
+
+        ray.DrawText("Congrats! You Combined Raylib (C api), Raygui and DVUI!", 20, 400, 20, ray.RAYWHITE);
+
+        dvuiStuff();
+
+        // marks end of dvui frame, don't call dvui functions after this
+        // - sends all dvui stuff to backend for rendering, must be called before EndDrawing()
+        _ = try win.end(.{ .manage_backend = false });
+
+        // cursor management
+        if (win.cursorRequestedFloating()) |cursor| {
+            // cursor is over floating window, dvui sets it
+            backend.setCursor(cursor);
+        } else {
+            // cursor should be handled by application
+            backend.setCursor(.arrow);
+        }
+
+        ray.EndDrawing();
+    }
+}
+
+fn colorPicker(result: *dvui.Color) void {
+    _ = dvui.spacer(@src(), .{ .min_size_content = .all(10) });
+    {
+        var overlay = dvui.overlay(@src(), .{ .min_size_content = .{ .w = 100, .h = 100 } });
+        defer overlay.deinit();
+
+        const bounds = RaylibBackend.dvuiRectToRaylib(overlay.data().contentRectScale().r);
+        var c_color: ray.Color = RaylibBackend.dvuiColorToRaylib(result.*);
+        _ = ray.GuiColorPicker(bounds, "Pick Color", &c_color);
+        result.* = RaylibBackend.raylibColorToDvui(c_color);
+    }
+
+    const color_hex = result.toHexString();
+
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+
+        dvui.labelNoFmt(@src(), &color_hex, .{}, .{
+            .color_text = .{ .color = result.* },
+            .gravity_y = 0.5,
+        });
+
+        const copy = dvui.button(@src(), "Copy", .{}, .{});
+
+        if (copy) {
+            dvui.clipboardTextSet(&color_hex);
+            dvui.toast(@src(), .{ .message = "Copied!" });
+        }
+    }
+}
+
+fn dvuiStuff() void {
+    var float = dvui.floatingWindow(@src(), .{}, .{ .max_size_content = .{ .w = 400, .h = 400 } });
+    defer float.deinit();
+
+    float.dragAreaSet(dvui.windowHeader("Floating Window", "", null));
+
+    var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
+    defer scroll.deinit();
+
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .font = .theme(.title) });
+    const lorem = "This example shows how to use dvui for floating windows on top of an existing application.";
+    tl.addText(lorem, .{});
+    tl.deinit();
+
+    var tl2 = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+    tl2.addText("The dvui is painting only floating windows and dialogs.\n\n", .{});
+    tl2.addText("Framerate is managed by the application (in this demo capped at vsync).\n\n", .{});
+    tl2.addText("Cursor is only being set by dvui for floating windows.\n\n", .{});
+    if (dvui.useFreeType) {
+        tl2.addText("Fonts are being rendered by FreeType 2.", .{});
+    } else {
+        tl2.addText("Fonts are being rendered by stb_truetype.", .{});
+    }
+    tl2.deinit();
+
+    const label = if (dvui.Examples.show_demo_window) "Hide Demo Window" else "Show Demo Window";
+    if (dvui.button(@src(), label, .{}, .{})) {
+        dvui.Examples.show_demo_window = !dvui.Examples.show_demo_window;
+    }
+
+    if (dvui.button(@src(), "Debug Window", .{}, .{})) {
+        dvui.toggleDebugWindow();
+    }
+
+    // only shows the demo if dvui.Examples.show_demo_window is true
+    // .full -> .lite or comment out to speed up compile times
+    dvui.Examples.demo(.full);
+}
