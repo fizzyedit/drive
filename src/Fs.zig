@@ -34,6 +34,8 @@ pub const Error = error{
     Forbidden,
     /// Any other transport-level failure.
     Http,
+    /// Any other failure of the storage itself — a local disk's I/O error, a full quota.
+    Io,
     InvalidJson,
     Cancelled,
     OutOfMemory,
