@@ -110,4 +110,3 @@ the chosen folder — shared ones included — becomes the root, `gdrive://<acco
   expiry. No refresh tokens exist for browser apps.
 
 Sign-in state and errors surface as toasts; details in the log with the `drive:` prefix.
->>>>>>> conflict 1 of 1 ends
