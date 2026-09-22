@@ -511,6 +511,7 @@ fn resolvePicked(st: *State) void {
 fn onPickedName(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
     const st: *State = @ptrCast(@alignCast(ctx.?));
     st.pending = null;
+    comeBack();
     const gpa = sdk.allocator();
     const id = st.picked_id;
     st.picked_id = &.{};
@@ -927,6 +928,14 @@ fn fail(st: *State, what: []const u8) void {
         return;
     }
     signOut(st, false);
+}
+
+/// The browser has the front after a sign-in or a pick; ask fizzy for it back. The command is
+/// fizzy's own and older builds do not have it, which is why the failure is ignored rather than
+/// reported — there is nothing the user could do about it.
+fn comeBack() void {
+    if (is_wasm) return;
+    sdk.host().runCommand("fizzy.focusWindow") catch {};
 }
 
 fn complain(msg: []const u8) void {
