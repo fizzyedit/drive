@@ -35,11 +35,15 @@
   }
   function show() {
     if (!token || !key) { msg.textContent = "The Drive plugin has no API key configured (README › Publisher setup)."; return; }
-    // Say the origin outright rather than letting the widget guess it. On the desktop this page
-    // is served by the plugin's own loopback listener on a fixed port, and that origin — and only
-    // that one — is registered on the web OAuth client, so it has to be the one the Picker is told.
-    const picker = new google.picker.PickerBuilder()
-      .setOrigin(location.protocol + "//" + location.host)
+    // `location.origin`, not protocol+host: fizzy opens this page as a blob: popup, where the
+    // protocol is "blob:" and the host is empty — that pair builds "blob://" and the Picker
+    // refuses it. A blob document inherits its creator's origin, so `location.origin` is the
+    // real one (https://fizzyed.it), which is what the web client authorises. Left unset if the
+    // browser reports an opaque origin, since a wrong answer is worse than none.
+    const pageOrigin = location.origin && location.origin !== "null" ? location.origin : "";
+    let builder = new google.picker.PickerBuilder();
+    if (pageOrigin) builder = builder.setOrigin(pageOrigin);
+    const picker = builder
       .setOAuthToken(token)
       .setDeveloperKey(key)
       .setAppId(appId || "")
@@ -59,6 +63,15 @@
     msg.textContent = "";
     picker.setVisible(true);
   }
+  // The Picker reports its own failures to the console and leaves the page blank, which is how
+  // a 403 arrives looking like nothing at all. Put something on the page instead.
+  window.addEventListener("error", (e) => {
+    msg.textContent = "Google's picker failed to load (origin " + (pageOriginForMsg() || "unknown") + "): " + (e.message || "see the console");
+  });
+  function pageOriginForMsg() {
+    return location.origin && location.origin !== "null" ? location.origin : "";
+  }
+
   const s = document.createElement("script");
   s.src = "https://apis.google.com/js/api.js";
   s.onload = () => gapi.load("picker", show);
