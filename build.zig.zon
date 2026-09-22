@@ -23,7 +23,11 @@
         },
         // Locally the SDK next door; a release pins the `fizzy-sdk-v*` asset URL instead.
         .fizzy = .{
-            .path = "../../fizzy/sdk",
+            // The published SDK, not a path into a checkout: a release has to build from a
+            // clean clone, and the release asset (never the tag's git archive) is the SDK
+            // package alone — the monorepo root zon carries the app's own dependencies.
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.0/fizzy-sdk-v0.2.0.tar.gz",
+            .hash = "fizzy-0.2.0-SGBwY88cFQDHj85JIzh2WxS3W6FUj3b3Sl_eI4vOtrsd",
         },
     },
 }

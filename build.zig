@@ -43,7 +43,7 @@ fn ensureCredentials(b: *std.Build) void {
         \\
     , .{ id, secret, web_id, key });
     b.build_root.handle.writeFile(io, .{ .sub_path = "credentials.zon", .data = text }) catch |err| {
-        std.debug.panic("zig-drive: could not write credentials.zon: {t}", .{err});
+        std.debug.panic("drive: could not write credentials.zon: {t}", .{err});
     };
-    if (id.len == 0) std.debug.print("zig-drive: no credentials.zon and FIZZY_DRIVE_CLIENT_ID unset — the plugin will refuse to sign in until one is provided\n", .{});
+    if (id.len == 0) std.debug.print("drive: no credentials.zon and FIZZY_DRIVE_CLIENT_ID unset — the plugin will refuse to sign in until one is provided\n", .{});
 }

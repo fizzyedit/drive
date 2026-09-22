@@ -15,7 +15,7 @@ browser cannot load plugins at runtime (`web_plugin_dirs` in fizzy's `build.zig`
 ## Install (development)
 
 ```sh
-cd ~/dev/fizzyedit/zig-drive
+cd ~/dev/fizzyedit/drive
 zig build          # → drive.dylib into fizzy's plugins dir
 zig build test
 ```
@@ -110,3 +110,4 @@ the chosen folder — shared ones included — becomes the root, `gdrive://<acco
   expiry. No refresh tokens exist for browser apps.
 
 Sign-in state and errors surface as toasts; details in the log with the `drive:` prefix.
+>>>>>>> conflict 1 of 1 ends

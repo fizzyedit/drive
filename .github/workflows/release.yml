@@ -1,0 +1,21 @@
+# Tagging `vX.Y.Z` builds every target and publishes binaries + manifest.json.
+# Identity SoT: plugin.zig.zon (tag must equal .version). SDK version + abi fingerprint
+# are derived from the built dylib (pinned fizzy SDK) — do not copy them here.
+#
+# Prerequisite: build.zig.zon must pin the fizzy SDK by URL+hash for CI (not a local path).
+#
+# This plugin builds its OAuth client id into the binary from `credentials.zon`, which is not in
+# the repo (see README §2). A release build without one still compiles — the plugin refuses to
+# sign in and says why — so CI needs the secret only when a release should be able to sign in.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    uses: fizzyedit/plugin-build-action/.github/workflows/build.yml@v5
+    permissions:
+      contents: write
+    with:
+      zig-version: "0.16.0"
