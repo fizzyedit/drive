@@ -457,11 +457,11 @@ fn openPicker(st: *State) void {
         st.picker_state = buf;
     }
     if (is_wasm) {
-        const page = core.transport.WebOAuth.pageUrl(gpa, "plugins/drive/picker.html") catch return complain("The picker page is not part of this web build.");
-        defer gpa.free(page);
-        const url = pickerUrl(gpa, page, st, "web") catch return;
-        defer gpa.free(url);
-        core.transport.WebOAuth.begin(gpa, url, onWebPicker, st) catch return complain("A Google window is already open.");
+        // The picker page travels with the plugin (it is embedded), opened as a same-origin
+        // blob page with its needs in the fragment — nothing to serve beside the app.
+        const hash = pickerUrl(gpa, "", st, "web") catch return;
+        defer gpa.free(hash);
+        core.transport.WebOAuth.beginPage(gpa, picker_page, hash[1..], onWebPicker, st) catch return complain("A Google window is already open.");
         return;
     }
     if (st.picker) |old| {
