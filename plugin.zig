@@ -23,18 +23,6 @@ const drive = @import("src/drive.zig");
 /// The app's OAuth clients, baked in at build time (see `credentials.zon.example`).
 const credentials = @import("credentials.zon");
 const icons = @import("icons");
-/// Google's JavaScript Picker wants an API key beside the token — the web build only; the
-/// desktop's picker is part of the consent screen and needs neither this nor the project
-/// number. Older `credentials.zon` files predate the field.
-const api_key: []const u8 = if (@hasField(@TypeOf(credentials), "api_key")) credentials.api_key else "";
-/// The Cloud project number, which the Picker sends as `setAppId`. Under `drive.file` that call
-/// is what hands this app the folder the user picked: without it the picker returns an id the
-/// app is not allowed to open. Older `credentials.zon` files predate the field.
-const project_number: []const u8 = if (@hasField(@TypeOf(credentials), "project_number")) credentials.project_number else "";
-/// Google's JavaScript Picker widget, which the *web* build opens as a same-origin popup. The
-/// desktop uses Google's picker for installed apps instead (see "two pickers" below), so this
-/// page is web-only.
-const picker_page = @embedFile("web/picker.html");
 
 const vfs = core.vfs;
 const is_wasm = builtin.target.cpu.arch == .wasm32;
@@ -77,11 +65,9 @@ const State = struct {
     phase: Phase = .signed_out,
     /// The desktop flow's listener while a browser tab is open. Native only.
     loopback: if (is_wasm) void else ?*oauth.Loopback = if (is_wasm) {} else null,
-    /// What the user picked in Google's own picker, waiting for the token exchange that
-    /// follows it to finish so the mount can be re-rooted there. Owned. Native only.
+    /// What the user picked in Google's own picker, waiting for the token that comes back
+    /// with it so the mount can be re-rooted there. Owned.
     picked_id: []u8 = &.{},
-    /// The nonce the picker's reply must echo (both targets). Owned.
-    picker_state: []u8 = &.{},
     pkce: if (is_wasm) void else oauth.Pkce = if (is_wasm) {} else undefined,
     /// Web: the `state` the implicit flow must echo. Owned.
     web_state: []u8 = &.{},
@@ -362,7 +348,7 @@ fn beginFrame(ptr: *anyopaque) void {
         if (client.takeUnauthorized()) stale = true;
     }
     if (connected(st) and st.pending == null and stale) {
-        if (is_wasm) requestWebToken(st, true) else startRefresh(st);
+        if (is_wasm) requestWebToken(st, true, false) else startRefresh(st);
     }
 }
 
@@ -383,7 +369,9 @@ fn signIn(st: *State) void {
     if (is_wasm) {
         if (credentials.web_client_id.len == 0) return complain("This build of the Drive plugin has no web OAuth client configured.");
         st.phase = .token;
-        requestWebToken(st, false);
+        // Connect and choose in one trip, as on the desktop: `drive.file` gives an account
+        // with nothing picked no view of anything.
+        requestWebToken(st, false, true);
         return;
     }
     if (credentials.client_id.len == 0) return complain("This build of the Drive plugin has no OAuth client configured.");
@@ -449,40 +437,38 @@ fn pollLoopback(st: *State) void {
 
 fn openPicker(st: *State) void {
     if (st.phase != .mounted and st.phase != .connected) return;
-    if (!is_wasm) {
-        // Google's picker for installed apps: it lives inside the consent screen, so choosing a
-        // folder is another (short) trip through OAuth rather than a widget this plugin hosts.
-        // What comes back is a fresh token that can see the chosen folder, which is the point —
-        // under `drive.file` the grant and the choice are the same act.
-        if (st.phase == .awaiting_code) return complain("A Google window is already open.");
-        startDesktopFlow(st, true) catch |err| {
-            dvui.log.err("drive: could not open the folder picker: {t}", .{err});
-            complain("Could not open your browser for the folder picker.");
+    if (st.phase == .awaiting_code) return complain("A Google window is already open.");
+    // Google's picker for apps that cannot host its JavaScript widget: it lives inside the
+    // consent screen, so choosing a folder is another (short) trip through OAuth, and the ids
+    // come back on the redirect. The desktop cannot host the widget because a loopback listener
+    // has no registrable origin; the web build cannot because fizzy opens a plugin's page as a
+    // blob: document, and the Picker refuses to run in one (a bare 403 in the popup). Under
+    // `drive.file` the grant and the choice are the same act anyway, so this is the honest shape
+    // for both.
+    if (is_wasm) {
+        st.web_state = blk: {
+            const gpa = sdk.allocator();
+            if (st.web_state.len != 0) gpa.free(st.web_state);
+            break :blk &.{};
         };
+        requestWebToken(st, false, true);
         return;
     }
-    if (api_key.len == 0) return complain("Google's folder picker needs an API key: add .api_key to credentials.zon (README › Publisher setup, step 5) and rebuild the plugin.");
-    const gpa = sdk.allocator();
-    if (st.picker_state.len == 0) {
-        var nonce: [24]u8 = undefined;
-        dvui.io.random(&nonce);
-        const buf = gpa.alloc(u8, 32) catch return;
-        _ = std.base64.url_safe_no_pad.Encoder.encode(buf, &nonce);
-        st.picker_state = buf;
-    }
-    // The picker page travels with the plugin (it is embedded), opened as a same-origin blob
-    // page with its needs in the fragment — nothing to serve beside the app. The web build has
-    // a real origin, registered on the web client, which is what the widget insists on.
-    const hash = pickerUrl(gpa, "", st) catch return;
-    defer gpa.free(hash);
-    core.transport.WebOAuth.beginPage(gpa, picker_page, hash[1..], onWebPicker, st) catch return complain("A Google window is already open.");
+    startDesktopFlow(st, true) catch |err| {
+        dvui.log.err("drive: could not open the folder picker: {t}", .{err});
+        complain("Could not open your browser for the folder picker.");
+    };
 }
 
 /// The first id from the redirect's `picked_file_ids`, kept until the exchange that follows it
 /// lands. Absent means this was a plain sign-in.
 fn takePickedId(st: *State, query: []const u8) void {
+    takePickedIds(st, oauth.queryParam(query, "picked_file_ids") orelse return);
+}
+
+/// `picked_file_ids` as Google sends it, still percent-encoded.
+fn takePickedIds(st: *State, raw: []const u8) void {
     const gpa = sdk.allocator();
-    const raw = oauth.queryParam(query, "picked_file_ids") orelse return;
     const ids = oauth.decode(gpa, raw) catch return;
     defer gpa.free(ids);
     // One folder is one root; a multi-select we never asked for takes the first.
@@ -536,44 +522,6 @@ fn onPickedName(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
     askWhoThisIs(st);
 }
 
-/// `<page>#token=…&key=…&state=…&mode=…` — the fragment, which no server is sent.
-fn pickerUrl(gpa: std.mem.Allocator, page: []const u8, st: *State) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, page);
-    try out.appendSlice(gpa, "#token=");
-    try oauth.appendEncoded(gpa, &out, st.access_token);
-    try out.appendSlice(gpa, "&key=");
-    try oauth.appendEncoded(gpa, &out, api_key);
-    try out.appendSlice(gpa, "&state=");
-    try out.appendSlice(gpa, st.picker_state);
-    try out.appendSlice(gpa, "&mode=web");
-    try out.appendSlice(gpa, "&app=");
-    try oauth.appendEncoded(gpa, &out, project_number);
-    return out.toOwnedSlice(gpa);
-}
-
-fn onWebPicker(ctx: ?*anyopaque, result: ?[]u8) void {
-    if (!is_wasm) return;
-    const st: *State = @ptrCast(@alignCast(ctx.?));
-    const text = result orelse return;
-    defer sdk.allocator().free(text);
-    const query = if (std.mem.startsWith(u8, text, "?")) text[1..] else text;
-    if (!std.mem.eql(u8, oauth.queryParam(query, "state") orelse "", st.picker_state)) return complain("The folder picker's reply did not match the request.");
-    onPicked(st, query);
-}
-
-/// The picker's reply: `id` + `name` re-root the mount there; `cancel` is nothing.
-fn onPicked(st: *State, query: []const u8) void {
-    const gpa = sdk.allocator();
-    const id = oauth.queryParam(query, "id") orelse return;
-    const raw_name = oauth.queryParam(query, "name") orelse "";
-    const name = oauth.decode(gpa, raw_name) catch return;
-    defer gpa.free(name);
-    const id_dec = oauth.decode(gpa, id) catch return;
-    defer gpa.free(id_dec);
-    remount(st, id_dec, name);
-}
 
 /// Tear the mount down and bring it up again rooted at `folder_id` (`"root"` for My Drive),
 /// which becomes the open folder. The account and token stay; only the mount changes — and
@@ -675,7 +623,7 @@ fn setToken(st: *State, token: []const u8, expires_in: i64) void {
 /// the token that can see it is this one). Mounted already (a refresh) → nothing more;
 /// otherwise find out whose drive this is.
 fn afterToken(st: *State) void {
-    if (!is_wasm and st.picked_id.len != 0) return resolvePicked(st);
+    if (st.picked_id.len != 0) return resolvePicked(st);
     if (st.phase == .mounted or st.phase == .connected) return;
     askWhoThisIs(st);
 }
@@ -881,8 +829,6 @@ fn signOut(st: *State, forget: bool) void {
             st.loopback = null;
         }
     }
-    if (st.picker_state.len != 0) gpa.free(st.picker_state);
-    st.picker_state = &.{};
     if (st.picked_id.len != 0) gpa.free(st.picked_id);
     st.picked_id = &.{};
     if (st.client) |client| {
@@ -964,7 +910,7 @@ fn setSetting(st: *State, comptime field: []const u8, value: []const u8) void {
 // token in the fragment. Nothing Google-specific lives in fizzy for this; the popup helper is
 // the same one any provider's plugin would use.
 
-fn requestWebToken(st: *State, silent: bool) void {
+fn requestWebToken(st: *State, silent: bool, pick: bool) void {
     if (!is_wasm) return;
     const gpa = sdk.allocator();
     const redirect = core.transport.WebOAuth.callbackUrl(gpa) catch return fail(st, "no callback page");
@@ -976,7 +922,7 @@ fn requestWebToken(st: *State, silent: bool) void {
         _ = std.base64.url_safe_no_pad.Encoder.encode(state_buf, &nonce);
         st.web_state = state_buf;
     }
-    const url = oauth.implicitAuthUrl(gpa, credentials.web_client_id, scopeOf(st), redirect, st.web_state, silent) catch return fail(st, "out of memory");
+    const url = oauth.implicitAuthUrl(gpa, credentials.web_client_id, scopeOf(st), redirect, st.web_state, silent, pick) catch return fail(st, "out of memory");
     defer gpa.free(url);
     core.transport.WebOAuth.begin(gpa, url, onWebOAuth, st) catch return fail(st, "a sign-in is already open");
 }
@@ -989,6 +935,7 @@ fn onWebOAuth(ctx: ?*anyopaque, result: ?[]u8) void {
     defer gpa.free(text);
     const parsed = oauth.parseImplicit(text) orelse return fail(st, "Google refused the sign-in");
     if (!std.mem.eql(u8, parsed.state, st.web_state)) return fail(st, "sign-in reply did not match the request");
+    if (parsed.picked_file_ids) |ids| takePickedIds(st, ids);
     setToken(st, parsed.access_token, parsed.expires_in);
     afterToken(st);
 }

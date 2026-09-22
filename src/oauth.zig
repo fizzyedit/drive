@@ -64,11 +64,14 @@ pub fn redirectUri(buf: *[40]u8, port: u16) []const u8 {
 /// The browser URL for the web build's implicit flow: the access token comes back in the
 /// fragment of `redirect_uri` (fizzy's `oauth-callback.html`), no exchange, no secret. Caller
 /// owns. `silent` asks Google to answer without a prompt — for renewing an expired token.
-pub fn implicitAuthUrl(allocator: std.mem.Allocator, client_id: []const u8, scope: []const u8, redirect_uri: []const u8, state: []const u8, silent: bool) ![]u8 {
+pub fn implicitAuthUrl(allocator: std.mem.Allocator, client_id: []const u8, scope: []const u8, redirect_uri: []const u8, state: []const u8, silent: bool, pick: bool) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, auth_endpoint ++ "?response_type=token&include_granted_scopes=true");
     if (silent) try out.appendSlice(allocator, "&prompt=none");
+    // Same picker the desktop uses (`authUrl`), and it answers an implicit grant too: the ids
+    // come back on the redirect beside the token. `prompt=consent` is required with it.
+    if (pick) try out.appendSlice(allocator, "&prompt=consent&trigger_onepick=true&allow_folder_selection=true");
     try appendParam(allocator, &out, "client_id", client_id);
     try appendParam(allocator, &out, "redirect_uri", redirect_uri);
     try appendParam(allocator, &out, "scope", scope);
@@ -81,6 +84,8 @@ pub const ImplicitResult = struct {
     access_token: []const u8,
     expires_in: i64,
     state: []const u8,
+    /// The picker's answer, when the request asked for one — comma-separated ids.
+    picked_file_ids: ?[]const u8 = null,
 };
 
 /// Parse the callback page's `search ++ hash`. Null when it carries no token (an `error=`).
@@ -92,6 +97,9 @@ pub fn parseImplicit(result: []const u8) ?ImplicitResult {
         .access_token = token,
         .expires_in = std.fmt.parseInt(i64, expires, 10) catch 3600,
         .state = queryParam(hash, "state") orelse "",
+        // Present only when the request asked for the picker. Google puts it in the query
+        // rather than the fragment, so look through the whole reply, not just the hash.
+        .picked_file_ids = queryParam(result, "picked_file_ids"),
     };
 }
 
