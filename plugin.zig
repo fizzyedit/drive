@@ -26,6 +26,10 @@ const icons = @import("icons");
 /// Google's Picker wants an API key beside the token. Older `credentials.zon` files predate
 /// the field; without it the folder picker says so instead of opening.
 const api_key: []const u8 = if (@hasField(@TypeOf(credentials), "api_key")) credentials.api_key else "";
+/// The Cloud project number, which the Picker sends as `setAppId`. Under `drive.file` that call
+/// is what hands this app the folder the user picked: without it the picker returns an id the
+/// app is not allowed to open. Older `credentials.zon` files predate the field.
+const project_number: []const u8 = if (@hasField(@TypeOf(credentials), "project_number")) credentials.project_number else "";
 /// Google's own folder picker, run in the browser: served by the loopback listener on the
 /// desktop, shipped beside the web app (`web/` is copied by fizzy's web build).
 const picker_page = @embedFile("web/picker.html");
@@ -251,11 +255,19 @@ fn storeRefreshToken(value: []const u8) void {
     };
 }
 
-/// The whole drive, always: with `drive.file` a fresh sign-in shows an empty drive and the
-/// desktop has no picker to change that. Publishing an app with this scope needs Google's
-/// verification; testers can use it meanwhile (README).
-fn scopeOf(_: *State) []const u8 {
-    return oauth.scope_full;
+/// `drive.file` — the files and folders the user hands over, and nothing else.
+///
+/// The whole drive (`scope_full`) is a *restricted* scope: publishing with it means Google's
+/// verification and an annual third-party security assessment, and until that is done a build
+/// can only be used by accounts added by hand as testers. `drive.file` is non-sensitive, so an
+/// app asking only for it publishes without review — and the picker, which now exists on the
+/// desktop as well as the web, is how the user says which folder they mean. That was the
+/// argument for full scope when this was written; it no longer holds.
+///
+/// Whole-drive access is still available to anyone who wants it and can be a tester on their own
+/// Cloud project: `full_drive_scope` in the plugin's settings.
+fn scopeOf(st: *State) []const u8 {
+    return if (st.settings.full_drive_scope.get()) oauth.scope_full else oauth.scope_file;
 }
 
 fn nowMs() i64 {
@@ -499,6 +511,8 @@ fn pickerUrl(gpa: std.mem.Allocator, page: []const u8, st: *State, mode: []const
     try out.appendSlice(gpa, st.picker_state);
     try out.appendSlice(gpa, "&mode=");
     try out.appendSlice(gpa, mode);
+    try out.appendSlice(gpa, "&app=");
+    try oauth.appendEncoded(gpa, &out, project_number);
     return out.toOwnedSlice(gpa);
 }
 

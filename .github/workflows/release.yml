@@ -13,6 +13,7 @@
 #     FIZZY_DRIVE_CLIENT_SECRET=...
 #     FIZZY_DRIVE_WEB_CLIENT_ID=...apps.googleusercontent.com
 #     FIZZY_DRIVE_API_KEY=...
+#     FIZZY_DRIVE_PROJECT_NUMBER=123456789012
 #
 # Without it the release still builds; the plugin then declines to sign in and says why in the
 # log, which is a working artifact for everything except signing in.

@@ -45,15 +45,20 @@ console).
 
 - User type: **External**.
 - App name `fizzy`, your email as user-support and developer contact. Logo/links optional.
-- **Scopes** → *Add or remove scopes* → tick `https://www.googleapis.com/auth/drive`
-  ("See, edit, create, and delete all of your Google Drive files"). The plugin always asks
-  for the whole drive — with the narrower `drive.file` a fresh sign-in shows an empty drive
-  until every file has been picked one by one. It is a *restricted* scope: testers can use it
-  as soon as it is added, and publishing to everyone later means Google's app verification.
-- **Test users** → add your own Google account(s). While the app's *Publishing status* is
-  **Testing**, only listed accounts can sign in (max 100). When it is time for strangers to
-  use it, press **Publish app** — with only `drive.file` requested that takes effect
-  immediately, no verification.
+- **Scopes** → *Add or remove scopes* → tick `https://www.googleapis.com/auth/drive.file`
+  ("See, edit, create and delete only the specific Google Drive files you use with this app").
+  That is the only scope the plugin asks for, and the folder picker is how the user says which
+  folder they mean — under this scope the picker's `setAppId` (step 5) is what actually hands
+  the app what was picked.
+- **Do not add `…/auth/drive`.** The whole drive is a *restricted* scope: an app requesting it
+  can only sign in accounts listed as test users until the Cloud project passes Google's
+  verification *and* an annual third-party security assessment. `drive.file` is non-sensitive,
+  so nothing is reviewed and there is no test-user cap. The plugin can still ask for the whole
+  drive — *Access the whole Drive* in its settings — which is for people running it against
+  their own Cloud project, not for a published build.
+- **Test users** → add your own Google account while the *Publishing status* is **Testing**.
+  With only `drive.file` requested you can press **Publish app** whenever you like; it takes
+  effect immediately, with no review.
 
 ### 4. Two OAuth clients
 
@@ -65,16 +70,33 @@ console).
 | web | **Web application** | *Authorized JavaScript origins*: `http://localhost:8765` for the local dev server, plus the real origin the web build is served from (e.g. `https://fizzyed.it`). *Authorized redirect URIs*: the same origins with `/oauth-callback.html` appended — `http://localhost:8765/oauth-callback.html`. | `credentials.zon` → `web_client_id` |
 
 Google issues the desktop client a "secret" and requires it at the token exchange even though
-a desktop app cannot keep a secret — Google's own docs say so. It is the *app's* credential,
-not any user's, and is safe to ship as a default; it does not grant access to anything by
-itself.
+a desktop app cannot keep a secret — RFC 8252 (*OAuth 2.0 for Native Apps*) classes installed
+apps as public clients for exactly this reason, and Google's own docs say the same. What
+protects the flow is PKCE, which this plugin does (S256, plus a `state` nonce). The secret is
+the *app's* credential, not any user's, and grants nothing by itself.
 
-### 5. An API key, for the folder picker
+**What ends up in a published binary**, measured rather than assumed: the desktop build carries
+`client_id`, `client_secret` and `api_key`; the web build carries `web_client_id` and `api_key`.
+Neither carries the other's client. Client ids are public by design — they appear in the URL
+the user sees while consenting — and an API key in a browser app is public too; both are
+protected by *restriction* in the console, not by secrecy.
+
+### 5. An API key and the project number, for the folder picker
 
 **Credentials › Create credentials › API key.** Google's Picker needs one beside the user's
 token. Under *Restrict key*: API restrictions → *Google Picker API* only. Leave the
 application (referrer) restriction off, or the desktop's `http://127.0.0.1:*` page cannot use
 it — the key grants nothing on its own.
+
+**And the project number** — the numeric id on the project's dashboard (*Cloud overview ›
+Dashboard › Project number*), not the project *id* string. The picker sends it as `setAppId`,
+and under `drive.file` that call is what grants this app the folder the user picked: without
+it the picker returns an id the plugin is then not allowed to open. It goes into
+`credentials.zon` as `project_number`.
+
+Two APIs have to be enabled for any of this to work, under **APIs & Services › Enable APIs and
+services**: **Google Drive API** and **Google Picker API**. Enabling an API asks for no scopes;
+scopes live only on the consent screen (step 3), and the API key has none at all.
 
 ### 6. Put the IDs in `credentials.zon`
 
@@ -82,10 +104,12 @@ it — the key grants nothing on its own.
 cp credentials.zon.example credentials.zon   # gitignored
 ```
 
-Fill in `client_id`, `client_secret` (desktop), `web_client_id` and `api_key`, then
-`zig build`. They are baked into the plugin; users never see them. CI does the same from the
-environment — `FIZZY_DRIVE_CLIENT_ID`, `FIZZY_DRIVE_CLIENT_SECRET`, `FIZZY_DRIVE_WEB_CLIENT_ID`,
-`FIZZY_DRIVE_API_KEY` — because `zig build` generates `credentials.zon` from those when the
+Fill in `client_id`, `client_secret` (desktop), `web_client_id`, `api_key` and
+`project_number`, then `zig build`. They are baked into the plugin; users never see them. CI
+does the same from the environment — `FIZZY_DRIVE_CLIENT_ID`, `FIZZY_DRIVE_CLIENT_SECRET`,
+`FIZZY_DRIVE_WEB_CLIENT_ID`, `FIZZY_DRIVE_API_KEY`, `FIZZY_DRIVE_PROJECT_NUMBER` — passed to
+the release workflow as one `DRIVE_BUILD_ENV` secret of KEY=VALUE lines, because `zig build`
+generates `credentials.zon` from those when the
 file is missing.
 
 ## What users see

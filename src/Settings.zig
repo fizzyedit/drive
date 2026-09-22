@@ -19,3 +19,12 @@ account: settings.Value([]const u8, .{
     .name = "Account",
     .description = "The signed-in account's email, which names the mount: gdrive://<account>.",
 }) = .init(""),
+
+full_drive_scope: settings.Value(bool, .{
+    .name = "Access the whole Drive",
+    .description = "Ask Google for access to every file instead of only the folders you pick. " ++
+        "Google treats this as a restricted scope: a build asking for it can only sign in accounts " ++
+        "added as testers on the Cloud project it was built with, until that project passes " ++
+        "Google's verification and security assessment. Off means the folder picker decides what " ++
+        "this plugin can see.",
+}) = .init(false),

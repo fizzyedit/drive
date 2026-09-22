@@ -8,11 +8,14 @@
   // which a server never sees — set by the plugin that opened this page:
   //   token  the signed-in account's access token
   //   key    the app's API key (Google requires one for the Picker)
+  //   app    the Cloud project number — `setAppId`, which is what grants this app the folder
+  //          the user picks. Under the `drive.file` scope nothing else does.
   //   state  a nonce the result must echo
   //   mode   "web": post the result to the opener (the fizzy web app);
   //          "loopback": navigate to it on this origin (the plugin's local listener).
   const p = new URLSearchParams(location.hash.slice(1));
   const token = p.get("token"), key = p.get("key"), state = p.get("state"), mode = p.get("mode");
+  const appId = p.get("app");
   const msg = document.getElementById("msg");
 
   function deliver(query) {
@@ -35,6 +38,7 @@
     const picker = new google.picker.PickerBuilder()
       .setOAuthToken(token)
       .setDeveloperKey(key)
+      .setAppId(appId || "")
       .setTitle("Open a Google Drive folder in fizzy")
       .addView(folderView(google.picker.ViewId.FOLDERS))
       .addView(folderView(google.picker.ViewId.DOCS).setOwnedByMe(false).setLabel("Shared with me"))
