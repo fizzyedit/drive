@@ -67,7 +67,7 @@ console).
 | Client | Type | Settings | Goes into |
 |---|---|---|---|
 | desktop | **Desktop app** | none | `credentials.zon` → `client_id`, `client_secret` |
-| web | **Web application** | *Authorized JavaScript origins*: `http://localhost:8765` for the local dev server, plus the real origin the web build is served from (e.g. `https://fizzyed.it`). *Authorized redirect URIs*: the same origins with `/oauth-callback.html` appended — `http://localhost:8765/oauth-callback.html`. | `credentials.zon` → `web_client_id` |
+| web | **Web application** | *Authorized JavaScript origins*: `http://localhost:8765` for the local dev server, plus the real origin the web build is served from (e.g. `https://fizzyed.it`). Only the web build needs these: the desktop's folder picker is part of Google's consent screen (`trigger_onepick`) and has no web origin at all. *Authorized redirect URIs*: the same origins with `/oauth-callback.html` appended — `http://localhost:8765/oauth-callback.html`. | `credentials.zon` → `web_client_id` |
 
 Google issues the desktop client a "secret" and requires it at the token exchange even though
 a desktop app cannot keep a secret — RFC 8252 (*OAuth 2.0 for Native Apps*) classes installed
@@ -83,8 +83,10 @@ protected by *restriction* in the console, not by secrecy.
 
 ### 5. An API key and the project number, for the folder picker
 
-**Credentials › Create credentials › API key.** Google's Picker needs one beside the user's
-token. Under *Restrict key*: API restrictions → *Google Picker API* only. Leave the
+**Credentials › Create credentials › API key.** Google's JavaScript Picker — the **web**
+build's folder picker — needs one beside the user's token. The desktop build does not: its
+picker is drawn by Google inside the consent screen and comes back through the OAuth redirect,
+so it needs neither an API key nor the project number. Under *Restrict key*: API restrictions → *Google Picker API* only. Leave the
 application (referrer) restriction off, or the desktop's `http://127.0.0.1:*` page cannot use
 it — the key grants nothing on its own.
 

@@ -35,7 +35,11 @@
   }
   function show() {
     if (!token || !key) { msg.textContent = "The Drive plugin has no API key configured (README › Publisher setup)."; return; }
+    // Say the origin outright rather than letting the widget guess it. On the desktop this page
+    // is served by the plugin's own loopback listener on a fixed port, and that origin — and only
+    // that one — is registered on the web OAuth client, so it has to be the one the Picker is told.
     const picker = new google.picker.PickerBuilder()
+      .setOrigin(location.protocol + "//" + location.host)
       .setOAuthToken(token)
       .setDeveloperKey(key)
       .setAppId(appId || "")

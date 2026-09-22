@@ -37,10 +37,17 @@ pub const Pkce = struct {
 };
 
 /// The browser URL that starts a desktop sign-in. Caller owns.
-pub fn authUrl(allocator: std.mem.Allocator, client_id: []const u8, scope: []const u8, port: u16, pkce: *const Pkce) ![]u8 {
+/// `pick` asks Google to show its own folder picker inside this consent flow — the documented
+/// way for an installed app to use the Picker (`trigger_onepick`). The chosen ids come back on
+/// the redirect as `picked_file_ids`, and under `drive.file` that grant *is* the access. It
+/// replaces hosting Google's JavaScript picker widget ourselves, which an installed app cannot
+/// do honestly: that widget is judged by the web origin it runs on, and a loopback listener has
+/// no origin anyone can register.
+pub fn authUrl(allocator: std.mem.Allocator, client_id: []const u8, scope: []const u8, port: u16, pkce: *const Pkce, pick: bool) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, auth_endpoint ++ "?response_type=code&access_type=offline&prompt=consent&code_challenge_method=S256");
+    if (pick) try out.appendSlice(allocator, "&trigger_onepick=true&allow_folder_selection=true");
     try appendParam(allocator, &out, "client_id", client_id);
     var redirect_buf: [40]u8 = undefined;
     try appendParam(allocator, &out, "redirect_uri", redirectUri(&redirect_buf, port));
