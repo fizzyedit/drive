@@ -5,8 +5,17 @@
 # Prerequisite: build.zig.zon must pin the fizzy SDK by URL+hash for CI (not a local path).
 #
 # This plugin builds its OAuth client id into the binary from `credentials.zon`, which is not in
-# the repo (see README §2). A release build without one still compiles — the plugin refuses to
-# sign in and says why — so CI needs the secret only when a release should be able to sign in.
+# the repo (see README §2). `build.zig` writes that file from the environment when it is absent,
+# so CI passes the four values as one `build_env` secret — `DRIVE_BUILD_ENV` in this repo's
+# settings, as KEY=VALUE lines:
+#
+#     FIZZY_DRIVE_CLIENT_ID=...apps.googleusercontent.com
+#     FIZZY_DRIVE_CLIENT_SECRET=...
+#     FIZZY_DRIVE_WEB_CLIENT_ID=...apps.googleusercontent.com
+#     FIZZY_DRIVE_API_KEY=...
+#
+# Without it the release still builds; the plugin then declines to sign in and says why in the
+# log, which is a working artifact for everything except signing in.
 name: Release
 on:
   push:
@@ -19,3 +28,5 @@ jobs:
       contents: write
     with:
       zig-version: "0.16.0"
+    secrets:
+      build_env: ${{ secrets.DRIVE_BUILD_ENV }}
