@@ -676,6 +676,7 @@ fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
     errdefer gpa.destroy(client);
     client.* = try drive.Client.init(gpa, dvui.io, st.transport, st.access_token, root_id);
     errdefer client.deinit();
+    client.look_ahead = true;
     try sdk.host().mount(prefix, client.fs());
 
     if (st.account.len != 0) gpa.free(st.account);
@@ -756,18 +757,20 @@ fn isUnder(path: []const u8, dir: []const u8) bool {
     return std.mem.startsWith(u8, path, dir) and (path.len == dir.len or path[dir.len] == '/');
 }
 
-/// The open folder is on this mount: walk it now, in batched queries, so whatever crawls it
-/// next (a vault index, a search) finds every listing already answered. See `Client.prefetch`.
+/// The open folder is on this mount: fetch the level beneath it now, so the folders the tree
+/// shows first open without a round trip. Everything deeper follows what is opened
+/// (`Client.lookahead`) — not a walk of the whole drive, which spent the quota on folders nobody
+/// looked at and made whatever was expanded wait behind it.
 fn prefetchOpenFolder(st: *State) void {
     const client = st.client orelse return;
     const folder = sdk.host().folder() orelse return;
     if (st.prefix.len == 0 or !isUnder(folder, st.prefix)) return;
     const rel = if (folder.len == st.prefix.len) "/" else folder[st.prefix.len..];
     if (client.tree.contains(rel)) {
-        client.prefetch(rel) catch |err| dvui.log.warn("drive: prefetch of {s} did not start: {t}", .{ folder, err });
+        client.lookahead(rel) catch |err| dvui.log.warn("drive: lookahead of {s} did not start: {t}", .{ folder, err });
         return;
     }
-    // A folder the index has not reached yet: resolve it first, then walk it.
+    // A folder the index has not reached yet: resolve it first, then look ahead of it.
     if (st.prefetch_stat) |job| client.fs().cancel(job);
     st.prefetch_stat = client.fs().stat(rel, onPrefetchStat, st) catch null;
 }

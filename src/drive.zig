@@ -114,6 +114,9 @@ pub const Client = struct {
     /// keeps the index honest (the change feed, or a prefetch that just read the tree).
     cache_listings: bool = false,
     walk: Prefetch = .{},
+    /// Follow every answered listing with a `lookahead` of its folders. The plugin turns it on
+    /// for a real mount; a test turns it on when lookahead is what it is testing.
+    look_ahead: bool = false,
     /// `changes.list` page token: where the next poll continues from. Owned; null until the
     /// first poll fetched a start token.
     changes_token: ?[]u8 = null,
@@ -222,7 +225,24 @@ pub const Client = struct {
         const node = self.tree.get(path) orelse return error.NotFound;
         if (node.kind != .dir) return error.NotADirectory;
         self.cache_listings = true;
-        try self.walk.queueDir(self.allocator, path, node.id);
+        _ = try self.walk.queueDir(self.allocator, path, node.id, Prefetch.unlimited);
+        self.walkIssue();
+    }
+
+    /// List the folders one level beneath `path` ahead of being asked, so opening one is
+    /// answered from the index. Called for every listing this client answers, which is what
+    /// makes it follow the user: the tree asks for what is expanded, so what is one click away
+    /// is what gets fetched — and a crawler asking folder by folder gets the next level batched
+    /// ahead of it. A folder already listed costs nothing (`walkTake` settles it from the index).
+    pub fn lookahead(self: *Client, path: []const u8) Fs.Error!void {
+        const node = self.tree.get(path) orelse return error.NotFound;
+        if (node.kind != .dir) return error.NotADirectory;
+        self.cache_listings = true;
+        if (node.listed) {
+            try self.walkQueueChildren(path, 0);
+        } else {
+            _ = try self.walk.queueDir(self.allocator, path, node.id, 1);
+        }
         self.walkIssue();
     }
 
@@ -231,10 +251,13 @@ pub const Client = struct {
         return self.walk.in_flight != 0 or self.walk.head < self.walk.queue.items.len;
     }
 
-    /// Start batch queries while there is room.
+    /// Start batch queries while there is room. One slot more than the walk's own is kept for
+    /// folders someone is waiting on, so they never queue behind a lookahead.
     fn walkIssue(self: *Client) void {
         const a = self.allocator;
-        while (self.walk.in_flight < prefetch_parallel) {
+        while (self.walk.in_flight < prefetch_parallel or
+            (self.walk.urgent.items.len != 0 and self.walk.in_flight < prefetch_parallel + 1))
+        {
             var dirs: std.ArrayList(BatchDir) = .empty;
             self.walkTake(&dirs) catch {
                 for (dirs.items) |d| d.free(a);
@@ -298,7 +321,7 @@ pub const Client = struct {
             if (node.listed) {
                 d.state = .done;
                 self.walk.need_wake = true;
-                try self.walkQueueChildren(path);
+                if (d.depth > 0) try self.walkQueueChildren(path, Prefetch.childDepth(d.depth));
                 continue;
             }
             d.state = .listing;
@@ -310,11 +333,11 @@ pub const Client = struct {
         }
     }
 
-    fn walkQueueChildren(self: *Client, dir: []const u8) Allocator.Error!void {
+    fn walkQueueChildren(self: *Client, dir: []const u8, depth: u8) Allocator.Error!void {
         const node = self.tree.get(dir) orelse return;
         for (node.children.keys()) |child| {
             const c = self.tree.get(child) orelse continue;
-            if (c.kind == .dir) try self.walk.queueDir(self.allocator, child, c.id);
+            if (c.kind == .dir) _ = try self.walk.queueDir(self.allocator, child, c.id, depth);
         }
     }
 
@@ -330,7 +353,8 @@ pub const Client = struct {
                 const node = self.tree.get(d.path) orelse continue;
                 if (node.kind != .dir or !std.mem.eql(u8, node.id, d.id)) continue;
                 self.tree.setListing(d.path, d.items.items, null) catch continue;
-                self.walkQueueChildren(d.path) catch {};
+                const depth = if (self.walk.dirs.get(d.path)) |w| w.depth else 0;
+                if (depth > 0) self.walkQueueChildren(d.path, Prefetch.childDepth(depth)) catch {};
             }
         } else |err| {
             if (dirs.len > 1 and err == error.Http) {
@@ -371,8 +395,11 @@ pub const Client = struct {
         }
     }
 
-    /// When the walk has `dir` queued or in flight, park `job` on it (bumping it to the front)
-    /// and say so; otherwise the job lists it itself.
+    /// A listing someone is waiting on, for a folder the walk knows: in flight already, it waits
+    /// for that answer; queued, it moves to the front and a batch goes out now, through the slot
+    /// the walk keeps for this (`walkIssue`). A folder the walk does not know is listed alone.
+    /// With lookahead on, a crawler's next folders are already in flight when it asks for them
+    /// (`deliverOne` looks ahead before delivering), so they come back from one query.
     fn waitForWalk(self: *Client, job: *Job, dir: []const u8) bool {
         const d = self.walk.dirs.getPtr(dir) orelse return false;
         switch (d.state) {
@@ -496,6 +523,11 @@ pub const Client = struct {
 
     fn deliverOne(self: *Client, job: *Job) void {
         _ = self.jobs.swapRemove(job.id);
+        // Whatever was just opened, its folders are next (`lookahead`). Queued *before* the answer
+        // is delivered: a crawler asks for every subfolder from inside its callback, and finds
+        // them already in flight together instead of asking one query each. Starting the batch
+        // does not wait on it, so the answer is not held up.
+        if (self.look_ahead and job.op == .list and job.result == .entries) self.lookahead(job.path) catch {};
         self.delivering = job;
         job.deliver();
         self.delivering = null;
@@ -555,17 +587,38 @@ const Prefetch = struct {
     const Dir = struct {
         id: []u8,
         state: enum { queued, listing, done } = .queued,
+        /// How many levels beneath this folder to queue once it is listed: 0 for a lookahead
+        /// (list it, nothing more), `unlimited` for a `prefetch` walk.
+        depth: u8,
     };
 
-    fn queueDir(self: *Prefetch, a: Allocator, path: []const u8, id: []const u8) Allocator.Error!void {
-        if (self.dirs.contains(path)) return;
+    const unlimited: u8 = std.math.maxInt(u8);
+
+    fn childDepth(depth: u8) u8 {
+        return if (depth == unlimited) unlimited else depth - 1;
+    }
+
+    /// Queue `path`, or deepen it when it is already queued shallower. False when it was
+    /// already there at least this deep.
+    fn queueDir(self: *Prefetch, a: Allocator, path: []const u8, id: []const u8, depth: u8) Allocator.Error!bool {
+        if (self.dirs.getPtr(path)) |d| {
+            if (depth <= d.depth) return false;
+            d.depth = depth;
+            // Listed already at a shallower depth: queue it again so its children follow.
+            if (d.state == .done) {
+                d.state = .queued;
+                try self.queue.append(a, self.dirs.getKey(path).?);
+            }
+            return true;
+        }
         const key = try a.dupe(u8, path);
         errdefer a.free(key);
         const id_copy = try a.dupe(u8, id);
         errdefer a.free(id_copy);
         try self.queue.ensureUnusedCapacity(a, 1);
-        try self.dirs.put(a, key, .{ .id = id_copy });
+        try self.dirs.put(a, key, .{ .id = id_copy, .depth = depth });
         self.queue.appendAssumeCapacity(key);
+        return true;
     }
 
     fn markDone(self: *Prefetch, path: []const u8) void {

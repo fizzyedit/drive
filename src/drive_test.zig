@@ -643,6 +643,16 @@ const walk_drive = [_]Scripted.Route{
     .{ .contains = "q=%28%27s1%27%20in%20parents%29", .body =
         \\{"files":[{"id":"d1","name":"deep.md","mimeType":"text/markdown","size":"7","parents":["s1"]}]}
     },
+    // One folder on its own — a listing that did not wait for the walk.
+    .{ .contains = "q=%27root%27%20in%20parents", .body =
+        \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder"},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder"},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3"}]}
+    },
+    .{ .contains = "q=%27n1%27%20in%20parents", .body =
+        \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","size":"5"},{"id":"s1","name":"sub","mimeType":"application/vnd.google-apps.folder"}]}
+    },
+    .{ .contains = "q=%27s1%27%20in%20parents", .body =
+        \\{"files":[{"id":"d1","name":"deep.md","mimeType":"text/markdown","size":"7"}]}
+    },
 };
 
 fn settleWalk(h: *Harness) !void {
@@ -687,7 +697,7 @@ test "prefetch walks the tree in batched queries, then listings answer from the 
     try std.testing.expectEqual(@as(usize, 3), h.scripted.log.items.len);
 }
 
-test "a listing of a folder the walk has queued waits for it instead of asking twice" {
+test "a listing someone waits on goes out at the front of the walk, batched" {
     const h = try Harness.init(std.testing.allocator, &walk_drive);
     defer h.deinit();
     try h.client.prefetch("/");
@@ -700,6 +710,72 @@ test "a listing of a folder the walk has queued waits for it instead of asking t
     try std.testing.expectEqualStrings("deep.md", h.sink.entries.?[0].name);
     // Every request was a walk query; nothing listed a folder on its own.
     try std.testing.expectEqual(h.scripted.log.items.len, countRequestsContaining(h, "q=%28"));
+}
+
+test "a crawler asking for every subfolder at once is answered by the lookahead's one batch" {
+    const h = try Harness.init(std.testing.allocator, &walk_drive);
+    defer h.deinit();
+    h.client.look_ahead = true;
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    // Both of root's folders asked for in the same breath, as an index walk does — by then
+    // the lookahead has them in flight, in one query.
+    var second: Sink = .{ .allocator = std.testing.allocator };
+    h.sink.reset();
+    _ = try h.fs().listDir(std.testing.allocator, "/notes", Sink.onList, &h.sink);
+    _ = try h.fs().listDir(std.testing.allocator, "/more", Sink.onList, &second);
+    try settle(h.fs(), &h.sink);
+    try settle(h.fs(), &second);
+    defer second.reset();
+    try std.testing.expectEqual(@as(usize, 2), h.sink.entries.?.len);
+    try std.testing.expectEqual(@as(usize, 1), second.entries.?.len);
+    try std.testing.expectEqual(@as(usize, 0), countRequestsContaining(h, "q=%27n1%27%20in%20parents"));
+    try std.testing.expectEqual(@as(usize, 0), countRequestsContaining(h, "q=%27m1%27%20in%20parents"));
+    try std.testing.expectEqual(@as(usize, 1), countRequestsContaining(h, "q=%28%27n1%27%20in%20parents%20or%20%27m1%27%20in%20parents%29"));
+}
+
+test "an answered listing fetches the folders one level beneath it, and no deeper" {
+    const h = try Harness.init(std.testing.allocator, &walk_drive);
+    defer h.deinit();
+    h.client.look_ahead = true;
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try settleWalk(h);
+    // notes and more were listed ahead, together; sub (a level further) was not.
+    try std.testing.expectEqual(@as(usize, 1), countRequestsContaining(h, "q=%28%27n1%27%20in%20parents%20or%20%27m1%27%20in%20parents%29"));
+    try std.testing.expect(h.client.pathOfId("s1") != null);
+    try std.testing.expect(h.client.pathOfId("d1") == null);
+
+    // Opening notes asks nothing of Drive: it was fetched ahead.
+    const before = h.scripted.log.items.len;
+    h.sink.reset();
+    _ = try h.fs().listDir(std.testing.allocator, "/notes", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(usize, 2), h.sink.entries.?.len);
+    try settleWalk(h);
+    // …and now sub, one level beneath what was opened, has been fetched in turn.
+    try std.testing.expect(h.scripted.log.items.len > before);
+    try std.testing.expect(h.client.pathOfId("d1") != null);
+}
+
+test "re-opening a folder already fetched ahead asks nothing more" {
+    const h = try Harness.init(std.testing.allocator, &walk_drive);
+    defer h.deinit();
+    h.client.look_ahead = true;
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try settleWalk(h);
+    h.sink.reset();
+    _ = try h.fs().listDir(std.testing.allocator, "/more", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try settleWalk(h);
+    const after_first = h.scripted.log.items.len;
+    h.sink.reset();
+    _ = try h.fs().listDir(std.testing.allocator, "/more", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try settleWalk(h);
+    try std.testing.expectEqual(after_first, h.scripted.log.items.len);
+    try std.testing.expectEqual(@as(usize, 1), h.sink.entries.?.len);
 }
 
 test "a refused batch is asked again in halves" {
