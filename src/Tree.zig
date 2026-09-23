@@ -93,6 +93,21 @@ pub fn pathOfId(self: *const Tree, id: []const u8) ?[]const u8 {
     return self.by_id.get(id);
 }
 
+/// Give the root its real Drive id. A mount of My Drive starts as the alias `"root"`, which
+/// Drive accepts in a query but never reports back — every child names the real id as its
+/// parent — so anything that routes by parent id has to learn it (see `Client.onBatchPage`).
+pub fn setRootId(self: *Tree, id: []const u8) Allocator.Error!void {
+    const root = self.nodes.get("/") orelse return;
+    if (std.mem.eql(u8, root.id, id)) return;
+    const copy = try self.gpa.dupe(u8, id);
+    errdefer self.gpa.free(copy);
+    const key = self.by_id.get(root.id) orelse self.nodes.getKey("/").?;
+    try self.by_id.put(self.gpa, copy, key);
+    _ = self.by_id.remove(root.id);
+    self.gpa.free(root.id);
+    root.id = copy;
+}
+
 /// Record `path` (which must not be in the index yet) and link it under its parent, when the
 /// parent is known. `what.name` is ignored; the path says where it goes.
 pub fn put(self: *Tree, path: []const u8, what: Listed) Allocator.Error!*Node {

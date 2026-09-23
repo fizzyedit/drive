@@ -107,7 +107,7 @@ pub const Client = struct {
     access_token: []const u8,
     /// The Drive folder id the mount's `/` stands for. `"root"` is My Drive; a picked folder's
     /// id makes that folder the root. Not owned.
-    root_id: []const u8 = "root",
+    root_id: []const u8 = root_alias,
 
     tree: Tree,
     /// Whether a listed directory may answer `listDir` from the index — true once something
@@ -1136,6 +1136,22 @@ const Job = struct {
                     try d.items.append(arena, copy.?);
                 }
             }
+            if (copy != null) continue;
+            // Matched no folder in the batch, so it is a child of one asked about by an alias:
+            // My Drive, as `"root"`, which Drive answers under its real id. Learn that id —
+            // for this batch (`batchDone` checks the id it listed against the tree's) and for
+            // the tree, so later batches and the change feed route by it directly. A file with
+            // more than one parent cannot say which of them is the root, so it teaches nothing.
+            if (file.parents.len != 1) continue;
+            for (dirs) |*d| {
+                if (!std.mem.eql(u8, d.id, root_alias)) continue;
+                const real = try a.dupe(u8, file.parents[0]);
+                a.free(d.id);
+                d.id = real;
+                try client.tree.setRootId(real);
+                try d.items.append(arena, try listedFromFile(arena, file));
+                break;
+            }
         }
         if (job.page_token) |t| a.free(t);
         job.page_token = null;
@@ -1342,6 +1358,9 @@ const File = struct {
     /// Only asked for by a prefetch query, which has to route each child to its folder.
     parents: []const []const u8 = &.{},
 };
+
+/// What Drive calls My Drive in a query. It never appears in a reply: see `Tree.setRootId`.
+const root_alias = "root";
 
 const ListResponse = struct {
     nextPageToken: ?[]const u8 = null,

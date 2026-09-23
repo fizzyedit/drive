@@ -630,9 +630,11 @@ test "a folder that came back as a file forgets what was beneath it" {
 }
 
 // A drive for the walk: / { notes/ { a.md, sub/ { deep.md } }, more/ { b.md }, top.md }
+// Asked about as `'root'`, answered under My Drive's real id — as Drive does: the alias is
+// accepted in a query and never reported back.
 const walk_drive = [_]Scripted.Route{
     .{ .contains = "q=%28%27root%27%20in%20parents%29", .body =
-        \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","parents":["root"]},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder","parents":["root"]},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3","parents":["root"]}]}
+        \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","parents":["0Aroot"]},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder","parents":["0Aroot"]},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3","parents":["0Aroot"]}]}
     },
     // Both of root's folders in one query, answered in one page.
     .{ .contains = "q=%28%27n1%27%20in%20parents%20or%20%27m1%27%20in%20parents%29", .body =
@@ -668,6 +670,15 @@ test "prefetch walks the tree in batched queries, then listings answer from the 
     try std.testing.expectEqual(@as(usize, 3), h.scripted.log.items.len);
     try std.testing.expectEqualStrings("/notes/sub/deep.md", h.client.pathOfId("d1").?);
     try std.testing.expectEqualStrings("/more/b.md", h.client.pathOfId("b1").?);
+    // My Drive is known by its real id from the first batch on, so the change feed can route
+    // a change at the top of the drive.
+    try std.testing.expectEqualStrings("/", h.client.pathOfId("0Aroot").?);
+
+    // The root answers with its children, not the empty listing the alias used to leave it.
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(usize, 3), h.sink.entries.?.len);
+    h.sink.reset();
 
     // A crawler arriving now asks nothing of Drive.
     _ = try h.fs().listDir(std.testing.allocator, "/notes", Sink.onList, &h.sink);
