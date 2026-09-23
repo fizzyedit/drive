@@ -68,6 +68,10 @@ const State = struct {
     /// What the user picked in Google's own picker, waiting for the token that comes back
     /// with it so the mount can be re-rooted there. Owned.
     picked_id: []u8 = &.{},
+    /// A folder was just picked, so the mount that follows is one the user asked to open.
+    /// Separate from `mountDrive`'s `open_it`, because the pick is resolved a request earlier
+    /// than the mount and the two are joined only by this.
+    open_picked: bool = false,
     pkce: if (is_wasm) void else oauth.Pkce = if (is_wasm) {} else undefined,
     /// Web: the `state` the implicit flow must echo. Owned.
     web_state: []u8 = &.{},
@@ -526,6 +530,12 @@ fn onPickedName(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
     defer parsed.deinit();
     const name = parsed.value.name;
 
+    // Picking a folder *is* asking for it: whichever way it gets mounted below, it opens.
+    // Without this a pick that arrived before the account was known (the whole first sign-in,
+    // where the exchange leaves `phase` at `.token`) mounted the folder and opened nothing,
+    // with no message either — the picker said "return to fizzy" and fizzy showed no change.
+    st.open_picked = true;
+
     // Already know whose drive this is → swap the mount's root. Otherwise this is the first
     // connect: record the choice and let the account lookup mount it.
     if (connected(st) and st.account.len != 0) return remount(st, id, name);
@@ -743,8 +753,24 @@ fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
     return false;
 }
 
-fn mountDrive(st: *State, email: []const u8, open_it: bool) !void {
+fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
     const gpa = sdk.allocator();
+    const open_it = open_it_arg or st.open_picked;
+    st.open_picked = false;
+    // A re-pick arrives while a mount is already up under the old root, and its prefix is a
+    // different string — so without this the old one would stay mounted beside the new.
+    if (st.client) |client| {
+        if (st.poll) |job| {
+            client.fs().cancel(job);
+            st.poll = null;
+        }
+        sdk.host().unmount(st.prefix);
+        client.deinit();
+        gpa.destroy(client);
+        st.client = null;
+        if (st.prefix.len != 0) gpa.free(st.prefix);
+        st.prefix = &.{};
+    }
     const account = try gpa.dupe(u8, email);
     errdefer gpa.free(account);
     // My Drive is `gdrive://<account>`; a picked folder is named after itself, so its paths
