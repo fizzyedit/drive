@@ -42,6 +42,7 @@ const vtable: sdk.Plugin.VTable = .{
     .initPlugin = initPlugin,
     .beginFrame = beginFrame,
     .needsContinuousRepaint = needsContinuousRepaint,
+    .onFolderOpen = onFolderOpen,
 };
 
 const Schema = sdk.settings.Schema(Settings);
@@ -93,6 +94,8 @@ const State = struct {
     /// The `changes.list` poll: when it last ran, and whether one is in flight.
     last_poll_ms: i64 = 0,
     poll: ?vfs.Job = null,
+    /// Resolving an open folder the index has not reached, before prefetching it.
+    prefetch_stat: ?vfs.Job = null,
     /// The account's profile picture, once fetched. Owned pixels (freed with the source).
     avatar: ?dvui.ImageSource = null,
     avatar_job: ?vfs.http.Job = null,
@@ -685,6 +688,8 @@ fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
     // a recent gdrive path can now resolve). Picking a folder makes it the root, replacing
     // whatever was; it closes like any other root.
     if (open_it) sdk.host().setProjectFolder(prefix) catch |err| dvui.log.warn("drive: could not open {s} as the folder: {t}", .{ prefix, err });
+    // Already the open folder (a recent reopened before the mount was up): walk it now.
+    prefetchOpenFolder(st);
     if (!open_it and std.mem.eql(u8, root_id, "root")) {
         const msg = std.fmt.allocPrint(sdk.host().arena(), "Google Drive connected as {s}.", .{email}) catch "Google Drive connected.";
         dvui.toast(@src(), .{ .message = msg });
@@ -692,28 +697,91 @@ fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
     sdk.refresh();
 }
 
-fn onChanges(ctx: ?*anyopaque, result: vfs.Error![][]u8) void {
+fn onChanges(ctx: ?*anyopaque, result: vfs.Error![]drive.Change) void {
     const st: *State = @ptrCast(@alignCast(ctx.?));
     st.poll = null;
     const gpa = sdk.allocator();
-    const paths = result catch |err| {
+    const changes = result catch |err| {
         // Silent at frame rate would be a request storm; once a minute is a log line.
         dvui.log.warn("drive: changes poll failed: {t}", .{err});
         st.last_poll_ms = nowMs() + 60_000;
         return;
     };
-    defer drive.Client.freeChanges(gpa, paths);
-    const files = sdk.host().files orelse return;
-    for (paths) |rel| {
-        const full = std.mem.concat(gpa, u8, &.{ st.prefix, if (vfs.path.isRoot(rel)) "" else rel }) catch continue;
-        defer gpa.free(full);
-        // The listing of the path itself (a directory that changed) and its parent's (a file
-        // that changed or went away).
-        files.invalidateListing(full);
+    defer drive.Client.freeChanges(gpa, changes);
+    if (changes.len == 0) return;
+    const host = sdk.host();
+    const arena = host.arena();
+
+    // What the disk's folder watcher would have said, for the paths under the open folder:
+    // the host reconciles its file table from these and hands them to every plugin, so a vault
+    // indexed from this drive re-reads exactly what changed instead of re-walking the drive.
+    // Anything outside the open folder only needs the table's listings dropped.
+    const folder = host.folder();
+    var events: std.ArrayList(sdk.Plugin.PathEvent) = .empty;
+    for (changes) |c| {
+        const full = mountPath(arena, st.prefix, c.path) catch continue;
+        const old = if (c.old_path.len != 0) mountPath(arena, st.prefix, c.old_path) catch continue else "";
+        if (folder != null and isUnder(full, folder.?)) {
+            events.append(arena, .{
+                .path = full,
+                .old_path = old,
+                .kind = switch (c.kind) {
+                    .created => .created,
+                    .modified => .modified,
+                    .deleted => .deleted,
+                    .renamed => .renamed,
+                },
+                .object = if (c.is_dir) .dir else .file,
+            }) catch continue;
+            continue;
+        }
+        const files = host.files orelse continue;
         if (std.fs.path.dirname(full)) |parent| files.invalidateListing(parent);
-        files.invalidateIndex();
+        if (old.len != 0) {
+            if (std.fs.path.dirname(old)) |parent| files.invalidateListing(parent);
+        }
+        if (c.is_dir) files.invalidateListing(full);
     }
-    if (paths.len != 0) sdk.refresh();
+    if (events.items.len != 0) host.notifyFolderPathsChanged(.{ .events = events.items, .truncated = false });
+    if (host.files) |files| files.invalidateIndex();
+    sdk.refresh();
+}
+
+/// `gdrive://<account>` + `/a/b` — the mount's root is the prefix itself.
+fn mountPath(arena: std.mem.Allocator, prefix: []const u8, rel: []const u8) ![]const u8 {
+    return std.mem.concat(arena, u8, &.{ prefix, if (vfs.path.isRoot(rel)) "" else rel });
+}
+
+fn isUnder(path: []const u8, dir: []const u8) bool {
+    return std.mem.startsWith(u8, path, dir) and (path.len == dir.len or path[dir.len] == '/');
+}
+
+/// The open folder is on this mount: walk it now, in batched queries, so whatever crawls it
+/// next (a vault index, a search) finds every listing already answered. See `Client.prefetch`.
+fn prefetchOpenFolder(st: *State) void {
+    const client = st.client orelse return;
+    const folder = sdk.host().folder() orelse return;
+    if (st.prefix.len == 0 or !isUnder(folder, st.prefix)) return;
+    const rel = if (folder.len == st.prefix.len) "/" else folder[st.prefix.len..];
+    if (client.tree.contains(rel)) {
+        client.prefetch(rel) catch |err| dvui.log.warn("drive: prefetch of {s} did not start: {t}", .{ folder, err });
+        return;
+    }
+    // A folder the index has not reached yet: resolve it first, then walk it.
+    if (st.prefetch_stat) |job| client.fs().cancel(job);
+    st.prefetch_stat = client.fs().stat(rel, onPrefetchStat, st) catch null;
+}
+
+fn onPrefetchStat(ctx: ?*anyopaque, result: vfs.Error!vfs.Stat) void {
+    const st: *State = @ptrCast(@alignCast(ctx.?));
+    st.prefetch_stat = null;
+    const s = result catch return;
+    if (s.kind != .dir) return;
+    prefetchOpenFolder(st);
+}
+
+fn onFolderOpen(ptr: *anyopaque, _: std.mem.Allocator) void {
+    prefetchOpenFolder(stateOf(ptr));
 }
 
 /// Back to signed out. `forget` also drops the saved refresh token, which is what the user
@@ -765,6 +833,10 @@ fn signOut(st: *State, forget: bool) void {
 /// let go of it.
 fn releaseClient(st: *State) void {
     const client = st.client orelse return;
+    if (st.prefetch_stat) |job| {
+        client.fs().cancel(job);
+        st.prefetch_stat = null;
+    }
     st.client = null;
     sdk.host().unmount(st.prefix);
     st.retired.append(sdk.allocator(), .{ .client = client }) catch destroyClient(client);

@@ -11,11 +11,27 @@
 //! one whole-drive `files.list` because it behaves the same under every scope — with
 //! `drive.file` and a picked folder, descendants are not guaranteed to be granted.
 //!
-//! `listDir` always refetches (the consumer is a cache calling on a miss) and reconciles the
-//! directory's children against the answer — what survives keeps its subtree, so a re-list
-//! never pulls paths out from under other ops in flight beneath it; everything else trusts
-//! the index. A host that learns of an outside change (`changes.list`, later) calls
-//! `forget(path)`.
+//! The index lives in `Tree.zig`: every directory knows its children and every id its path,
+//! so nothing here walks the whole index. A listing reconciles the directory's children against
+//! Drive's answer — what survives keeps its subtree, so a re-list never pulls paths out from
+//! under other ops in flight beneath it.
+//!
+//! ## Freshness
+//!
+//! Once the change feed is running (`pollChanges` has a token) or a `prefetch` has walked a
+//! tree, a listed directory answers `listDir` from the index: the feed is what keeps it true,
+//! folding every outside edit into the index as it reports it (`onChangesPage`). Before that,
+//! `listDir` refetches — the caller is a cache calling on a miss.
+//!
+//! ## Prefetch
+//!
+//! A crawl of a real drive is tens of thousands of folders, one `files.list` each, against a
+//! per-minute quota. `prefetch(path)` walks the tree beneath `path` breadth-first instead, asking
+//! for the children of `prefetch_batch` folders in one query (`'a' in parents or 'b' in
+//! parents …`) with a few such queries in flight: requests fall by the batch size, and a crawler
+//! arriving afterwards (a vault scan) finds every listing already answered. An op that needs a
+//! directory the walk has queued waits for it — and moves it to the front — rather than listing
+//! it a second time.
 //!
 //! ## Every op is a small state machine
 //!
@@ -44,17 +60,26 @@ const all_drives_list = "&supportsAllDrives=true&includeItemsFromAllDrives=true"
 const upload_api = "https://www.googleapis.com/upload/drive/v3/files";
 const file_fields = "id,name,mimeType,size,modifiedTime";
 
-/// What Drive told us about one path.
-const Node = struct {
-    id: []u8,
-    kind: Fs.Kind,
-    size: u64 = 0,
-    modified_ms: i64 = 0,
-    /// A Google Doc / Sheet / Slide: exists, has no bytes.
-    google_app: bool = false,
-    /// Children have been listed at least once, so a name missing from the index is `NotFound`
-    /// rather than "not looked yet".
-    listed: bool = false,
+pub const Tree = @import("Tree.zig");
+
+/// Folders asked about in one prefetch query. Drive refuses a query past some complexity it
+/// does not publish; fifty `in parents` clauses is well inside it, and a refusal halves the
+/// batch (`batchDone`).
+const prefetch_batch: usize = 50;
+/// Prefetch queries in flight at once. Each is one request against the quota however many
+/// folders it covers, so a few is plenty.
+const prefetch_parallel: usize = 4;
+
+/// One outside change the feed reported, as a path under the mount — what a folder watcher
+/// would have said for the disk.
+pub const Change = struct {
+    pub const Kind = enum { created, modified, deleted, renamed };
+    kind: Kind,
+    is_dir: bool,
+    /// Owned.
+    path: []u8,
+    /// The path it had before, for `.renamed`; empty otherwise. Owned.
+    old_path: []u8 = &.{},
 };
 
 /// Drive charges a *query cost* per user per minute, and a recursive walk of a real drive
@@ -84,7 +109,11 @@ pub const Client = struct {
     /// id makes that folder the root. Not owned.
     root_id: []const u8 = "root",
 
-    index: std.StringHashMapUnmanaged(Node) = .empty,
+    tree: Tree,
+    /// Whether a listed directory may answer `listDir` from the index — true once something
+    /// keeps the index honest (the change feed, or a prefetch that just read the tree).
+    cache_listings: bool = false,
+    walk: Prefetch = .{},
     /// `changes.list` page token: where the next poll continues from. Owned; null until the
     /// first poll fetched a start token.
     changes_token: ?[]u8 = null,
@@ -105,17 +134,18 @@ pub const Client = struct {
     }
 
     pub fn init(allocator: Allocator, io: std.Io, transport: http.Transport, access_token: []const u8, root_id: []const u8) Allocator.Error!Client {
-        var self: Client = .{
+        var tree = try Tree.init(allocator, root_id);
+        errdefer tree.deinit();
+        const self: Client = .{
             .allocator = allocator,
             .io = io,
             .transport = transport,
             .access_token = access_token,
             .root_id = root_id,
+            .tree = tree,
             .ready = .init(allocator),
+            .initialised = true,
         };
-        errdefer self.deinit();
-        try self.index.put(allocator, try allocator.dupe(u8, "/"), .{ .id = try allocator.dupe(u8, root_id), .kind = .dir });
-        self.initialised = true;
         return self;
     }
 
@@ -124,12 +154,8 @@ pub const Client = struct {
         for (self.jobs.values()) |job| job.destroy();
         self.jobs.deinit(self.allocator);
         self.ready.deinit();
-        var it = self.index.iterator();
-        while (it.next()) |kv| {
-            self.allocator.free(kv.key_ptr.*);
-            self.allocator.free(kv.value_ptr.id);
-        }
-        self.index.deinit(self.allocator);
+        self.walk.deinit(self.allocator);
+        self.tree.deinit();
     }
 
     pub fn fs(self: *Client) Fs.Fs {
@@ -138,20 +164,25 @@ pub const Client = struct {
         return .{ .ptr = self, .vtable = &vtable, .remote = true };
     }
 
-    /// Paths whose contents changed on Drive since the last poll (files the index knew about
-    /// have been forgotten already; directories are un-listed). Owned by the callback.
-    pub const ChangesFn = *const fn (ctx: ?*anyopaque, result: Fs.Error![][]u8) void;
+    /// What changed on Drive since the last poll, already folded into the index. Owned by the
+    /// callback (`freeChanges`).
+    pub const ChangesFn = *const fn (ctx: ?*anyopaque, result: Fs.Error![]Change) void;
 
-    pub fn freeChanges(allocator: Allocator, paths: [][]u8) void {
-        for (paths) |p| allocator.free(p);
-        allocator.free(paths);
+    pub fn freeChanges(allocator: Allocator, changes: []Change) void {
+        for (changes) |c| {
+            allocator.free(c.path);
+            allocator.free(c.old_path);
+        }
+        allocator.free(changes);
     }
 
     /// Ask Drive what changed since the last call. The first call only fetches a start token
     /// and answers with nothing — changes are relative to a moment, and that is the moment.
-    /// Each path reported is one the index knew: a file's own path when it was modified or
-    /// removed, or its parent when something appeared under a listed directory. The host
-    /// invalidates those listings; nothing here draws.
+    /// Each change is applied to the index before it is reported (a rename moves the subtree, a
+    /// deletion drops it, a new file under a listed folder is added), so a listing answered from
+    /// the index afterwards is already right; the report is for everything *else* that caches —
+    /// the host's file table, a vault's index. Only paths under a folder the index has seen are
+    /// reported: nothing can be holding anything else.
     pub fn pollChanges(self: *Client, allocator: Allocator, cb: ChangesFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         return self.start("/", null, .{ .changes = .{ .allocator = allocator, .cb = cb, .ctx = ctx } });
     }
@@ -160,56 +191,205 @@ pub const Client = struct {
     /// root is never dropped, only un-listed.
     pub fn forget(self: *Client, path: []const u8) void {
         if (Fs.path.isRoot(path)) {
-            self.forgetChildren("/");
+            self.tree.clearChildren("/");
             return;
         }
-        self.drop(path);
-        if (self.index.getPtr(Fs.path.dirname(path))) |parent| parent.listed = false;
-    }
-
-    /// Remove `path` and everything beneath it from the index, trusting the parent's listing
-    /// otherwise — what a successful `remove` knows, where `forget` does not.
-    fn drop(self: *Client, path: []const u8) void {
-        self.forgetChildren(path);
-        if (self.index.fetchRemove(path)) |kv| {
-            self.allocator.free(kv.key);
-            self.allocator.free(kv.value.id);
-        }
-    }
-
-    fn forgetChildren(self: *Client, dir: []const u8) void {
-        var doomed: std.ArrayList([]const u8) = .empty;
-        defer doomed.deinit(self.allocator);
-        var it = self.index.keyIterator();
-        while (it.next()) |key| {
-            if (isBeneath(key.*, dir)) doomed.append(self.allocator, key.*) catch return;
-        }
-        for (doomed.items) |key| {
-            const kv = self.index.fetchRemove(key).?;
-            self.allocator.free(kv.key);
-            self.allocator.free(kv.value.id);
-        }
-        if (self.index.getPtr(dir)) |node| node.listed = false;
+        self.tree.remove(path);
+        if (self.tree.get(Fs.path.dirname(path))) |parent| parent.listed = false;
     }
 
     /// The path the index holds for a Drive id, or null when it has never listed it.
     pub fn pathOfId(self: *Client, id: []const u8) ?[]const u8 {
-        var it = self.index.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.eql(u8, kv.value_ptr.id, id)) return kv.key_ptr.*;
+        return self.tree.pathOfId(id);
+    }
+
+    /// The path (a copy, owned) of the first of `parents` the index holds as a directory.
+    fn knownParent(self: *Client, parents: []const []const u8) Allocator.Error!?[]u8 {
+        for (parents) |pid| {
+            const p = self.tree.pathOfId(pid) orelse continue;
+            const node = self.tree.get(p) orelse continue;
+            if (node.kind == .dir) return try self.allocator.dupe(u8, p);
         }
         return null;
+    }
+
+    // -- prefetch ----------------------------------------------------------------------------
+
+    /// Walk the tree beneath `path` in batched queries (see the file header). `path` must be a
+    /// directory the index already holds — the mount root always is; for anything else, `stat`
+    /// it first. Idempotent: a directory already walked, or being walked, is not asked twice.
+    pub fn prefetch(self: *Client, path: []const u8) Fs.Error!void {
+        const node = self.tree.get(path) orelse return error.NotFound;
+        if (node.kind != .dir) return error.NotADirectory;
+        self.cache_listings = true;
+        try self.walk.queueDir(self.allocator, path, node.id);
+        self.walkIssue();
+    }
+
+    /// Whether a prefetch still has work queued or in flight.
+    pub fn prefetching(self: *const Client) bool {
+        return self.walk.in_flight != 0 or self.walk.head < self.walk.queue.items.len;
+    }
+
+    /// Start batch queries while there is room.
+    fn walkIssue(self: *Client) void {
+        const a = self.allocator;
+        while (self.walk.in_flight < prefetch_parallel) {
+            var dirs: std.ArrayList(BatchDir) = .empty;
+            self.walkTake(&dirs) catch {
+                for (dirs.items) |d| d.free(a);
+                dirs.deinit(a);
+                return;
+            };
+            if (dirs.items.len == 0) {
+                dirs.deinit(a);
+                if (!self.prefetching()) {
+                    self.walk.reset(a);
+                    self.walk.need_wake = true;
+                }
+                break;
+            }
+            const owned = dirs.toOwnedSlice(a) catch {
+                for (dirs.items) |d| d.free(a);
+                dirs.deinit(a);
+                return;
+            };
+            self.walk.in_flight += 1;
+            _ = self.start("/", null, .{ .batch = .{ .dirs = owned } }) catch |err| {
+                // `start` frees nothing of the op on failure; the directories fall back to
+                // being listed one at a time when something asks.
+                std.log.warn("drive: prefetch batch could not start: {t}", .{err});
+                self.walk.in_flight -= 1;
+                for (owned) |d| {
+                    self.walk.markDone(d.path);
+                    d.free(a);
+                }
+                a.free(owned);
+                return;
+            };
+        }
+        // Directories the walk settled without asking (listed another way, or gone): whatever
+        // was parked on them can go.
+        if (self.walk.need_wake) self.wakeWaiting();
+    }
+
+    /// The next batch: directories something is waiting on first, then breadth-first. One
+    /// already listed another way is not asked again — its subfolders are queued from the index.
+    fn walkTake(self: *Client, out: *std.ArrayList(BatchDir)) Allocator.Error!void {
+        const a = self.allocator;
+        const batch = self.walk.batch;
+        while (out.items.len < batch) {
+            const path = if (self.walk.urgent.pop()) |u| u else if (self.walk.head < self.walk.queue.items.len) blk: {
+                self.walk.head += 1;
+                break :blk self.walk.queue.items[self.walk.head - 1];
+            } else break;
+            const d = self.walk.dirs.getPtr(path) orelse continue;
+            if (d.state != .queued) continue;
+            const node = self.tree.get(path) orelse {
+                d.state = .done;
+                self.walk.need_wake = true;
+                continue;
+            };
+            if (node.kind != .dir or !std.mem.eql(u8, node.id, d.id)) {
+                d.state = .done;
+                self.walk.need_wake = true;
+                continue;
+            }
+            if (node.listed) {
+                d.state = .done;
+                self.walk.need_wake = true;
+                try self.walkQueueChildren(path);
+                continue;
+            }
+            d.state = .listing;
+            const path_copy = try a.dupe(u8, path);
+            errdefer a.free(path_copy);
+            const id_copy = try a.dupe(u8, d.id);
+            errdefer a.free(id_copy);
+            try out.append(a, .{ .path = path_copy, .id = id_copy });
+        }
+    }
+
+    fn walkQueueChildren(self: *Client, dir: []const u8) Allocator.Error!void {
+        const node = self.tree.get(dir) orelse return;
+        for (node.children.keys()) |child| {
+            const c = self.tree.get(child) orelse continue;
+            if (c.kind == .dir) try self.walk.queueDir(self.allocator, child, c.id);
+        }
+    }
+
+    /// A batch has answered (or failed). Apply what it listed, queue what it found, and wake
+    /// whatever was waiting on those directories.
+    fn batchDone(self: *Client, job: *Job, result: Fs.Error!void) void {
+        const a = self.allocator;
+        self.walk.in_flight -= 1;
+        const dirs = job.op.batch.dirs;
+        if (result) |_| {
+            for (dirs) |*d| {
+                self.walk.markDone(d.path);
+                const node = self.tree.get(d.path) orelse continue;
+                if (node.kind != .dir or !std.mem.eql(u8, node.id, d.id)) continue;
+                self.tree.setListing(d.path, d.items.items, null) catch continue;
+                self.walkQueueChildren(d.path) catch {};
+            }
+        } else |err| {
+            if (dirs.len > 1 and err == error.Http) {
+                // Most likely "the query is too complex": ask about fewer at once, and put these
+                // back to be asked again.
+                self.walk.batch = @max(1, dirs.len / 2);
+                for (dirs) |d| {
+                    if (self.walk.dirs.getPtr(d.path)) |w| {
+                        w.state = .queued;
+                        self.walk.urgent.append(a, self.walk.dirs.getKey(d.path).?) catch {
+                            w.state = .done;
+                        };
+                    }
+                }
+            } else {
+                std.log.warn("drive: prefetch of {d} folder(s) failed ({t}); they will be listed when asked for", .{ dirs.len, err });
+                for (dirs) |d| self.walk.markDone(d.path);
+            }
+        }
+        self.wakeWaiting();
+        self.walkIssue();
+    }
+
+    /// Ops parked on a directory the walk had queued: re-run the ones whose directory is done.
+    /// Collected first: a job re-run can park again, which starts a batch, which adds to `jobs`.
+    fn wakeWaiting(self: *Client) void {
+        self.walk.need_wake = false;
+        var ready_now: std.ArrayList(*Job) = .empty;
+        defer ready_now.deinit(self.allocator);
+        for (self.jobs.values()) |job| {
+            if (job.phase != .await_prefetch) continue;
+            if (self.walk.pending(job.waiting)) continue;
+            ready_now.append(self.allocator, job) catch break;
+        }
+        for (ready_now.items) |job| {
+            job.phase = .resolve;
+            job.step();
+        }
+    }
+
+    /// When the walk has `dir` queued or in flight, park `job` on it (bumping it to the front)
+    /// and say so; otherwise the job lists it itself.
+    fn waitForWalk(self: *Client, job: *Job, dir: []const u8) bool {
+        const d = self.walk.dirs.getPtr(dir) orelse return false;
+        switch (d.state) {
+            .done => return false,
+            .queued => self.walk.urgent.append(self.allocator, self.walk.dirs.getKey(dir).?) catch return false,
+            .listing => {},
+        }
+        job.phase = .await_prefetch;
+        job.waiting = dir;
+        self.walkIssue();
+        return true;
     }
 
     fn setChangesToken(self: *Client, token: []const u8) Allocator.Error!void {
         const copy = try self.allocator.dupe(u8, token);
         if (self.changes_token) |t| self.allocator.free(t);
         self.changes_token = copy;
-    }
-
-    fn isBeneath(path: []const u8, dir: []const u8) bool {
-        if (Fs.path.isRoot(dir)) return !Fs.path.isRoot(path);
-        return path.len > dir.len and std.mem.startsWith(u8, path, dir) and path[dir.len] == '/';
     }
 
     const vtable: Fs.Fs.VTable = .{
@@ -357,6 +537,78 @@ pub const Client = struct {
     }
 };
 
+/// A prefetch's bookkeeping: every directory it has queued, and in what order.
+const Prefetch = struct {
+    /// Path (owned) → id (owned) and how far it got. Kept until the walk is over, so the
+    /// slices in `queue` and `urgent` stay valid.
+    dirs: std.StringHashMapUnmanaged(Dir) = .empty,
+    /// Breadth-first order; slices of `dirs` keys. `head` is the next to take.
+    queue: std.ArrayListUnmanaged([]const u8) = .empty,
+    head: usize = 0,
+    /// Asked for by a waiting op; taken first. Slices of `dirs` keys.
+    urgent: std.ArrayListUnmanaged([]const u8) = .empty,
+    in_flight: usize = 0,
+    batch: usize = prefetch_batch,
+    /// A directory was settled outside `batchDone`; parked ops need a look.
+    need_wake: bool = false,
+
+    const Dir = struct {
+        id: []u8,
+        state: enum { queued, listing, done } = .queued,
+    };
+
+    fn queueDir(self: *Prefetch, a: Allocator, path: []const u8, id: []const u8) Allocator.Error!void {
+        if (self.dirs.contains(path)) return;
+        const key = try a.dupe(u8, path);
+        errdefer a.free(key);
+        const id_copy = try a.dupe(u8, id);
+        errdefer a.free(id_copy);
+        try self.queue.ensureUnusedCapacity(a, 1);
+        try self.dirs.put(a, key, .{ .id = id_copy });
+        self.queue.appendAssumeCapacity(key);
+    }
+
+    fn markDone(self: *Prefetch, path: []const u8) void {
+        if (self.dirs.getPtr(path)) |d| d.state = .done;
+    }
+
+    /// Queued or in flight — something waiting on it should keep waiting.
+    fn pending(self: *const Prefetch, path: []const u8) bool {
+        const d = self.dirs.get(path) orelse return false;
+        return d.state != .done;
+    }
+
+    /// The walk is over: let its bookkeeping go (the index keeps everything it learned).
+    fn reset(self: *Prefetch, a: Allocator) void {
+        self.deinit(a);
+        self.* = .{};
+    }
+
+    fn deinit(self: *Prefetch, a: Allocator) void {
+        var it = self.dirs.iterator();
+        while (it.next()) |kv| {
+            a.free(kv.key_ptr.*);
+            a.free(kv.value_ptr.id);
+        }
+        self.dirs.deinit(a);
+        self.queue.deinit(a);
+        self.urgent.deinit(a);
+    }
+};
+
+/// One directory in a prefetch query, and what came back for it. Strings owned (client
+/// allocator); `items` borrow from the job's arena.
+const BatchDir = struct {
+    path: []u8,
+    id: []u8,
+    items: std.ArrayListUnmanaged(Tree.Listed) = .empty,
+
+    fn free(d: BatchDir, a: Allocator) void {
+        a.free(d.path);
+        a.free(d.id);
+    }
+};
+
 /// One in-flight op. Owned by the client from `start` until delivered or cancelled.
 /// Whether this refusal is "you are going too fast" rather than "no". Google returns 429 for
 /// some of them and 403 for others, with the reason in the body — the status alone cannot tell
@@ -385,13 +637,14 @@ const Job = struct {
     /// Directory whose children are being listed, and the next page to ask for.
     listing: []const u8 = "",
     page_token: ?[]u8 = null,
-    /// The listed names, in Drive order, so `listDir` returns what this listing saw and not
-    /// whatever the index accumulated.
-    seen: std.ArrayList([]const u8) = .empty,
-    /// The same names (the same slices), for the duplicate check and `completeListing`.
-    seen_set: std.StringHashMapUnmanaged(void) = .empty,
-    /// A changes poll's paths, accumulated across its pages. Owned (client allocator).
-    changed: std.ArrayList([]u8) = .empty,
+    /// A listing's children across its pages, in Drive order; strings in `arena`.
+    listed: std.ArrayListUnmanaged(Tree.Listed) = .empty,
+    /// Page data that must outlive one page's JSON: listed names and ids.
+    arena: ?std.heap.ArenaAllocator = null,
+    /// The directory an `await_prefetch` job is parked on (a slice of `path` or `resolving`).
+    waiting: []const u8 = "",
+    /// A changes poll's changes, accumulated across its pages. Owned (client allocator).
+    changed: std.ArrayList(Change) = .empty,
     /// A conditional write's `modifiedTime` check has come back and matched.
     write_checked: bool = false,
 
@@ -417,6 +670,8 @@ const Job = struct {
         resolve,
         /// A page of `listing`'s children is in flight.
         list_page,
+        /// Parked until a prefetch has listed `waiting`.
+        await_prefetch,
         /// The op's own request is in flight.
         request,
         done,
@@ -431,6 +686,9 @@ const Job = struct {
         rename: struct { cb: Fs.DoneFn, ctx: ?*anyopaque },
         remove: struct { cb: Fs.DoneFn, ctx: ?*anyopaque },
         changes: struct { allocator: Allocator, cb: Client.ChangesFn, ctx: ?*anyopaque },
+        /// A prefetch query: the children of every folder in `dirs` (owned), paged. No caller;
+        /// it reports to `Client.batchDone`.
+        batch: struct { dirs: []BatchDir },
     };
 
     /// Set exactly once by `finish`; consumed by `deliver`.
@@ -440,7 +698,7 @@ const Job = struct {
         entries: []Fs.Entry,
         stat: Fs.Stat,
         read: Fs.Read,
-        changed: [][]u8,
+        changed: []Change,
         ok,
     };
 
@@ -449,16 +707,22 @@ const Job = struct {
         if (job.pending) |p| job.client.transport.cancel(p);
         job.freeRequest();
         if (job.page_token) |t| a.free(t);
-        job.seen_set.deinit(a);
-        for (job.seen.items) |name| a.free(name);
-        job.seen.deinit(a);
+        job.listed.deinit(a);
+        if (job.arena) |*ar| ar.deinit();
         switch (job.result) {
             .entries => |entries| Fs.freeEntries(job.op.list.allocator, entries),
             .read => |r| job.op.read.allocator.free(r.bytes),
-            .changed => |paths| Client.freeChanges(job.op.changes.allocator, paths),
+            .changed => |changes| Client.freeChanges(job.op.changes.allocator, changes),
             else => {},
         }
-        for (job.changed.items) |p| a.free(p);
+        if (job.op == .batch) {
+            for (job.op.batch.dirs) |d| d.free(a);
+            a.free(job.op.batch.dirs);
+        }
+        for (job.changed.items) |c| {
+            a.free(c.path);
+            a.free(c.old_path);
+        }
         job.changed.deinit(a);
         a.free(job.path);
         a.free(job.path2);
@@ -556,6 +820,11 @@ const Job = struct {
                 .err => |e| e,
                 else => unreachable,
             }),
+            .batch => job.client.batchDone(job, switch (result) {
+                .ok => {},
+                .err => |e| e,
+                else => unreachable,
+            }),
             inline .write, .create, .rename, .remove => |o| o.cb(o.ctx, switch (result) {
                 .ok => {},
                 .err => |e| e,
@@ -583,18 +852,19 @@ const Job = struct {
                 while (it.next()) |seg| {
                     const child_path_end = @intFromPtr(seg.ptr) + seg.len - @intFromPtr(job.resolving.ptr);
                     const child_path = job.resolving[0..child_path_end];
-                    if (client.index.contains(child_path)) {
+                    if (client.tree.contains(child_path)) {
                         dir = child_path;
                         continue;
                     }
-                    const parent = client.index.getPtr(dir) orelse return error.NotFound;
+                    const parent = client.tree.get(dir) orelse return error.NotFound;
                     if (parent.kind != .dir) return error.NotADirectory;
                     if (parent.listed) return error.NotFound;
+                    if (client.waitForWalk(job, dir)) return;
                     return job.beginListing(dir);
                 }
                 try job.resolved();
             },
-            .list_page, .request, .done => {},
+            .list_page, .request, .done, .await_prefetch => {},
         }
     }
 
@@ -617,7 +887,7 @@ const Job = struct {
         };
         var url: std.ArrayList(u8) = .empty;
         errdefer url.deinit(a);
-        try url.appendSlice(a, "https://www.googleapis.com/drive/v3/changes?pageSize=1000" ++ all_drives_list ++ "&fields=newStartPageToken,nextPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,parents))&pageToken=");
+        try url.appendSlice(a, "https://www.googleapis.com/drive/v3/changes?pageSize=1000" ++ all_drives_list ++ "&fields=newStartPageToken,nextPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,parents,trashed))&pageToken=");
         try appendQueryValue(a, &url, token);
         try client.send(job, .GET, try url.toOwnedSlice(a), null, &.{}, null);
     }
@@ -626,16 +896,21 @@ const Job = struct {
     fn resolved(job: *Job) Fs.Error!void {
         const client = job.client;
         const a = client.allocator;
-        const node = client.index.getPtr(job.resolving) orelse return error.NotFound;
+        const node = client.tree.get(job.resolving) orelse return error.NotFound;
         switch (job.op) {
             .changes => try job.requestChanges(),
+            .batch => {
+                job.phase = .list_page;
+                try job.requestBatchPage();
+            },
             .list => {
                 if (node.kind != .dir) return error.NotADirectory;
-                // Always refetch — the caller is a cache and this is its miss path. What the
-                // index already holds beneath it stays until the listing comes back and says
-                // which children are gone (`completeListing`): forgetting the subtree up front
-                // pulled it out from under every other op walking it — a vault scan's deeper
-                // listings then failed NotFound whenever anything re-listed an ancestor.
+                // Answered from the index while something keeps it honest (see "Freshness");
+                // otherwise refetched — the caller is a cache and this is its miss path. What the
+                // index holds beneath it stays until the listing says which children are gone
+                // (`Tree.setListing`), so a re-list never pulls paths out from under other ops.
+                if (node.listed and client.cache_listings) return job.completeFromIndex();
+                if (client.waitForWalk(job, job.path)) return;
                 try job.beginListing(job.path);
             },
             .stat => job.complete(.{ .stat = .{ .kind = node.kind, .size = node.size, .modified_ms = node.modified_ms } }),
@@ -664,7 +939,7 @@ const Job = struct {
                 // `resolving` is the parent; its listing is complete only once `listed`.
                 if (node.kind != .dir) return error.NotADirectory;
                 if (!node.listed) return job.beginListing(job.resolving);
-                if (client.index.contains(job.path)) return error.Exists;
+                if (client.tree.contains(job.path)) return error.Exists;
                 const meta = try std.json.Stringify.valueAlloc(a, .{
                     .name = Fs.path.basename(job.path),
                     .parents = [_][]const u8{node.id},
@@ -684,9 +959,9 @@ const Job = struct {
                 }
                 if (node.kind != .dir) return error.NotADirectory;
                 if (!node.listed) return job.beginListing(job.resolving);
-                if (client.index.contains(job.path2)) return error.Exists;
-                const src = client.index.getPtr(job.path) orelse return error.NotFound;
-                const old_parent = client.index.getPtr(Fs.path.dirname(job.path)) orelse return error.NotFound;
+                if (client.tree.contains(job.path2)) return error.Exists;
+                const src = client.tree.get(job.path) orelse return error.NotFound;
+                const old_parent = client.tree.get(Fs.path.dirname(job.path)) orelse return error.NotFound;
                 const meta = try std.json.Stringify.valueAlloc(a, .{ .name = Fs.path.basename(job.path2) }, .{});
                 errdefer a.free(meta);
                 // A plain rename keeps its parent; Google rejects add == remove.
@@ -700,10 +975,7 @@ const Job = struct {
             .remove => {
                 if (node.kind == .dir) {
                     if (!node.listed) return job.beginListing(job.path);
-                    var it = client.index.keyIterator();
-                    while (it.next()) |key| {
-                        if (Client.isBeneath(key.*, job.path)) return error.NotEmpty;
-                    }
+                    if (node.children.count() != 0) return error.NotEmpty;
                 }
                 const meta = try std.json.Stringify.valueAlloc(a, .{ .trashed = true }, .{});
                 errdefer a.free(meta);
@@ -723,9 +995,39 @@ const Job = struct {
     fn requestPage(job: *Job) Fs.Error!void {
         const client = job.client;
         // Another op may have forgotten this directory while a page was in flight.
-        const dir_node = client.index.get(job.listing) orelse return error.NotFound;
+        const dir_node = client.tree.get(job.listing) orelse return error.NotFound;
         const url = try buildListUrl(client.allocator, dir_node.id, job.page_token);
         try client.send(job, .GET, url, null, &.{}, null);
+    }
+
+    fn requestBatchPage(job: *Job) Fs.Error!void {
+        const client = job.client;
+        const url = try buildBatchUrl(client.allocator, job.op.batch.dirs, job.page_token);
+        try client.send(job, .GET, url, null, &.{}, null);
+    }
+
+    fn pageArena(job: *Job) Allocator {
+        if (job.arena == null) job.arena = std.heap.ArenaAllocator.init(job.client.allocator);
+        return job.arena.?.allocator();
+    }
+
+    /// The listing's answer, from the index.
+    fn completeFromIndex(job: *Job) Fs.Error!void {
+        const client = job.client;
+        const o = job.op.list;
+        const node = client.tree.get(job.path) orelse return error.NotFound;
+        var entries: std.ArrayList(Fs.Entry) = .empty;
+        errdefer {
+            for (entries.items) |e| o.allocator.free(e.name);
+            entries.deinit(o.allocator);
+        }
+        try entries.ensureTotalCapacity(o.allocator, node.children.count());
+        for (node.children.keys()) |child| {
+            const c = client.tree.get(child) orelse continue;
+            const name = try o.allocator.dupe(u8, Fs.path.basename(child));
+            entries.appendAssumeCapacity(.{ .name = name, .kind = c.kind, .size = c.size, .modified_ms = c.modified_ms });
+        }
+        job.complete(.{ .entries = try entries.toOwnedSlice(o.allocator) });
     }
 
     fn onResponse(ctx: ?*anyopaque, result: Fs.Error!http.Response) void {
@@ -758,9 +1060,9 @@ const Job = struct {
             },
         }
         switch (job.phase) {
-            .list_page => try job.onListPage(resp.body),
+            .list_page => if (job.op == .batch) try job.onBatchPage(resp.body) else try job.onListPage(resp.body),
             .request => try job.onRequestDone(resp.body),
-            .resolve, .done => unreachable,
+            .resolve, .done, .await_prefetch => unreachable,
         }
     }
 
@@ -773,44 +1075,11 @@ const Job = struct {
         };
         defer parsed.deinit();
 
-        const for_caller = job.op == .list and std.mem.eql(u8, job.listing, job.path);
-        for (parsed.value.files) |file| {
-            // First-listed wins: Drive allows siblings with one name; a path cannot.
-            if (for_caller and job.seen_set.contains(file.name)) continue;
-            const child = try Fs.path.join(a, job.listing, file.name);
-            if (client.index.getPtr(child)) |node| {
-                if (!for_caller) {
-                    // An ancestor listed on the way to something else: what is known stays.
-                    a.free(child);
-                    continue;
-                }
-                if (std.mem.eql(u8, node.id, file.id)) {
-                    // The same file or folder as before: fresh metadata, and a folder keeps
-                    // what is known beneath it.
-                    const fresh = nodeFromFile(file, node.id);
-                    node.kind = fresh.kind;
-                    node.size = fresh.size;
-                    node.modified_ms = fresh.modified_ms;
-                    node.google_app = fresh.google_app;
-                    const became_file = fresh.kind != .dir;
-                    // `child` is freed *after* this, not before: `forgetChildren` reads it, and
-                    // freeing first was a use-after-free that segfaulted inside `startsWith`.
-                    // It also invalidates `node` (it removes entries from the same map), so
-                    // nothing may touch that pointer below.
-                    if (became_file) client.forgetChildren(child);
-                    a.free(child);
-                    try job.noteSeen(file.name);
-                    continue;
-                }
-                // Another item now holds the name: nothing beneath the old one is its.
-                client.drop(child);
-            }
-            errdefer a.free(child);
-            const id = try a.dupe(u8, file.id);
-            errdefer a.free(id);
-            try client.index.put(a, child, nodeFromFile(file, id));
-            if (for_caller) try job.noteSeen(file.name);
-        }
+        // Accumulated, not applied page by page: which children are *gone* is only known once
+        // the last page is in.
+        const arena = job.pageArena();
+        try job.listed.ensureUnusedCapacity(a, parsed.value.files.len);
+        for (parsed.value.files) |file| job.listed.appendAssumeCapacity(try listedFromFile(arena, file));
 
         if (job.page_token) |t| a.free(t);
         job.page_token = null;
@@ -821,50 +1090,62 @@ const Job = struct {
             }
         }
 
-        (client.index.getPtr(job.listing) orelse return error.NotFound).listed = true;
-        if (for_caller) return job.completeListing();
-        // An ancestor listing on the way to something else: keep resolving.
-        job.phase = .resolve;
-        try job.stepInner();
-    }
-
-    fn noteSeen(job: *Job, name: []const u8) Allocator.Error!void {
-        const a = job.client.allocator;
-        const copy = try a.dupe(u8, name);
-        errdefer a.free(copy);
-        try job.seen.append(a, copy);
-        errdefer _ = job.seen.pop();
-        try job.seen_set.put(a, copy, {});
-    }
-
-    fn completeListing(job: *Job) Fs.Error!void {
-        const client = job.client;
-        const o = job.op.list;
-        // Children the index held from before that this listing did not return are gone.
-        {
-            var gone: std.ArrayList([]const u8) = .empty;
-            defer gone.deinit(client.allocator);
-            var it = client.index.keyIterator();
-            while (it.next()) |key| {
-                if (Fs.path.isRoot(key.*) or !std.mem.eql(u8, Fs.path.dirname(key.*), job.path)) continue;
-                if (!job.seen_set.contains(Fs.path.basename(key.*))) try gone.append(client.allocator, key.*);
-            }
-            for (gone.items) |key| client.drop(key);
+        const for_caller = job.op == .list and std.mem.eql(u8, job.listing, job.path);
+        if (!for_caller) {
+            // An ancestor listed on the way to something else: record it, keep resolving.
+            try client.tree.setListing(job.listing, job.listed.items, null);
+            job.listed.clearRetainingCapacity();
+            job.phase = .resolve;
+            return job.stepInner();
         }
+
+        var took: std.ArrayList(usize) = .empty;
+        defer took.deinit(a);
+        try client.tree.setListing(job.listing, job.listed.items, &took);
+        const o = job.op.list;
         var entries: std.ArrayList(Fs.Entry) = .empty;
         errdefer {
             for (entries.items) |e| o.allocator.free(e.name);
             entries.deinit(o.allocator);
         }
-        for (job.seen.items) |name| {
-            const child = try Fs.path.join(client.allocator, job.path, name);
-            defer client.allocator.free(child);
-            const node = client.index.get(child) orelse continue;
-            const copy = try o.allocator.dupe(u8, name);
-            errdefer o.allocator.free(copy);
-            try entries.append(o.allocator, .{ .name = copy, .kind = node.kind, .size = node.size, .modified_ms = node.modified_ms });
+        try entries.ensureTotalCapacity(o.allocator, took.items.len);
+        for (took.items) |i| {
+            const l = job.listed.items[i];
+            entries.appendAssumeCapacity(.{ .name = try o.allocator.dupe(u8, l.name), .kind = l.kind, .size = l.size, .modified_ms = l.modified_ms });
         }
         job.complete(.{ .entries = try entries.toOwnedSlice(o.allocator) });
+    }
+
+    /// One page of a prefetch query: route each child to the folder(s) it is in.
+    fn onBatchPage(job: *Job, body: []const u8) Fs.Error!void {
+        const client = job.client;
+        const a = client.allocator;
+        const parsed = std.json.parseFromSlice(ListResponse, a, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidJson,
+        };
+        defer parsed.deinit();
+        const arena = job.pageArena();
+        const dirs = job.op.batch.dirs;
+        for (parsed.value.files) |file| {
+            var copy: ?Tree.Listed = null;
+            for (file.parents) |pid| {
+                for (dirs) |*d| {
+                    if (!std.mem.eql(u8, d.id, pid)) continue;
+                    if (copy == null) copy = try listedFromFile(arena, file);
+                    try d.items.append(arena, copy.?);
+                }
+            }
+        }
+        if (job.page_token) |t| a.free(t);
+        job.page_token = null;
+        if (parsed.value.nextPageToken) |next| {
+            if (next.len != 0) {
+                job.page_token = try a.dupe(u8, next);
+                return job.requestBatchPage();
+            }
+        }
+        job.complete(.ok);
     }
 
     fn onRequestDone(job: *Job, body: []const u8) Fs.Error!void {
@@ -872,7 +1153,7 @@ const Job = struct {
         const a = client.allocator;
         switch (job.op) {
             .read => |o| {
-                const mtime = if (client.index.get(job.path)) |n| n.modified_ms else 0;
+                const mtime = if (client.tree.get(job.path)) |n| n.modified_ms else 0;
                 job.complete(.{ .read = .{ .bytes = try o.allocator.dupe(u8, body), .modified_ms = mtime } });
             },
             .write => |o| {
@@ -882,7 +1163,7 @@ const Job = struct {
                     defer file.deinit();
                     const live = parseRfc3339Ms(file.value.modifiedTime);
                     if (live != o.opts.if_unmodified_ms.?) {
-                        if (client.index.getPtr(job.path)) |node| node.modified_ms = live;
+                        if (client.tree.get(job.path)) |node| node.modified_ms = live;
                         return error.Conflict;
                     }
                     job.write_checked = true;
@@ -892,7 +1173,7 @@ const Job = struct {
                 }
                 if (parseFile(a, body)) |file| {
                     defer file.deinit();
-                    if (client.index.getPtr(job.path)) |node| {
+                    if (client.tree.get(job.path)) |node| {
                         node.size = parseSize(file.value.size);
                         node.modified_ms = parseRfc3339Ms(file.value.modifiedTime);
                     }
@@ -902,23 +1183,19 @@ const Job = struct {
             .create => {
                 const file = try parseFile(a, body);
                 defer file.deinit();
-                const id = try a.dupe(u8, file.value.id);
-                errdefer a.free(id);
-                const key = try a.dupe(u8, job.path);
-                errdefer a.free(key);
-                try client.index.put(a, key, nodeFromFile(file.value, id));
+                if (!client.tree.contains(job.path)) _ = try client.tree.put(job.path, try listedFromFile(null, file.value));
                 job.complete(.ok);
             },
             .rename => {
-                try job.moveIndex(job.path, job.path2);
+                try client.tree.rename(job.path, job.path2);
                 job.complete(.ok);
             },
             .remove => {
-                client.drop(job.path);
+                client.tree.remove(job.path);
                 job.complete(.ok);
             },
             .changes => try job.onChangesPage(body),
-            .list, .stat => unreachable,
+            .list, .stat, .batch => unreachable,
         }
     }
 
@@ -932,32 +1209,15 @@ const Job = struct {
         defer parsed.deinit();
         const v = parsed.value;
 
-        // The first poll: only a start token comes back.
+        // The first poll: only a start token comes back. From here the feed keeps the index
+        // honest, so listed directories can answer from it (see "Freshness").
         if (v.startPageToken) |t| {
             try client.setChangesToken(t);
+            client.cache_listings = true;
             return job.completeChanges();
         }
 
-        for (v.changes) |ch| {
-            const id = ch.fileId orelse continue;
-            if (client.pathOfId(id)) |known| {
-                // Something the index holds: its own listing (a directory) or its parent's
-                // (a file) is stale, and so is anything cached beneath it.
-                try job.noteChanged(known);
-                const parent = Fs.path.dirname(known);
-                try job.noteChanged(parent);
-                client.forget(known);
-                continue;
-            }
-            // New to us: if it landed in a directory we have listed, that listing is stale.
-            const file = ch.file orelse continue;
-            for (file.parents) |pid| {
-                if (client.pathOfId(pid)) |parent| {
-                    try job.noteChanged(parent);
-                    if (client.index.getPtr(parent)) |pn| pn.listed = false;
-                }
-            }
-        }
+        for (v.changes) |ch| try job.applyChange(ch);
 
         if (v.nextPageToken) |next| {
             try client.setChangesToken(next);
@@ -967,44 +1227,107 @@ const Job = struct {
         job.completeChanges();
     }
 
-    fn noteChanged(job: *Job, path: []const u8) Fs.Error!void {
-        for (job.changed.items) |p| {
-            if (std.mem.eql(u8, p, path)) return;
+    /// Fold one reported change into the index, and note it for the caller. The index is what
+    /// `listDir` answers from once the feed is running, so this is what keeps it true.
+    fn applyChange(job: *Job, ch: ChangeJson) Fs.Error!void {
+        const client = job.client;
+        const a = client.allocator;
+        const tree = &client.tree;
+        const id = ch.fileId orelse return;
+        const gone = ch.removed or (if (ch.file) |f| f.trashed else false);
+
+        if (tree.pathOfId(id)) |known_in_tree| {
+            // Copied: every branch below can remove or re-key the path it names.
+            const known = try a.dupe(u8, known_in_tree);
+            defer a.free(known);
+            const node = tree.get(known) orelse return;
+            const is_dir = node.kind == .dir;
+            if (gone) {
+                tree.remove(known);
+                return job.noteChange(.deleted, is_dir, known, "");
+            }
+            const file = ch.file orelse {
+                if (!is_dir) try job.noteChange(.modified, false, known, "");
+                return;
+            };
+            // Where it is now: under the first parent the index knows. None means it moved
+            // somewhere this mount does not reach, which from here is a deletion.
+            const parent = (try client.knownParent(file.parents)) orelse {
+                tree.remove(known);
+                return job.noteChange(.deleted, is_dir, known, "");
+            };
+            defer a.free(parent);
+            const now = try Fs.path.join(a, parent, file.name);
+            defer a.free(now);
+            const fresh = try listedFromChanged(file);
+            if (std.mem.eql(u8, now, known)) {
+                // Same place: its contents (a file) or nothing we track (a folder's own metadata).
+                if (is_dir) return;
+                if (node.size == fresh.size and node.modified_ms == fresh.modified_ms) return;
+                node.size = fresh.size;
+                node.modified_ms = fresh.modified_ms;
+                return job.noteChange(.modified, false, known, "");
+            }
+            if (tree.contains(now)) {
+                // Moved onto a name the index already holds: neither listing can be trusted.
+                tree.remove(known);
+                try job.noteChange(.deleted, is_dir, known, "");
+                if (tree.get(parent)) |p| p.listed = false;
+                return job.noteChange(.created, is_dir, now, "");
+            }
+            try tree.rename(known, now);
+            if (tree.get(now)) |moved| {
+                moved.size = fresh.size;
+                moved.modified_ms = fresh.modified_ms;
+            }
+            return job.noteChange(.renamed, is_dir, now, known);
         }
-        const copy = try job.client.allocator.dupe(u8, path);
-        errdefer job.client.allocator.free(copy);
-        try job.changed.append(job.client.allocator, copy);
+
+        // New to the index: added under each listed parent the index knows, so the listing
+        // stays complete; reported either way, since a cache elsewhere may hold that folder.
+        if (gone) return;
+        const file = ch.file orelse return;
+        const fresh = try listedFromChanged(file);
+        for (file.parents) |pid| {
+            const parent_in_tree = tree.pathOfId(pid) orelse continue;
+            const parent = try a.dupe(u8, parent_in_tree);
+            defer a.free(parent);
+            const pnode = tree.get(parent) orelse continue;
+            if (pnode.kind != .dir) continue;
+            const path = try Fs.path.join(a, parent, file.name);
+            defer a.free(path);
+            if (pnode.listed and !tree.contains(path)) _ = try tree.put(path, fresh);
+            try job.noteChange(.created, fresh.kind == .dir, path, "");
+        }
+    }
+
+    fn noteChange(job: *Job, kind: Change.Kind, is_dir: bool, path: []const u8, old_path: []const u8) Fs.Error!void {
+        const a = job.client.allocator;
+        const p = try a.dupe(u8, path);
+        errdefer a.free(p);
+        const o = try a.dupe(u8, old_path);
+        errdefer a.free(o);
+        try job.changed.append(a, .{ .kind = kind, .is_dir = is_dir, .path = p, .old_path = o });
     }
 
     fn completeChanges(job: *Job) void {
         const o = job.op.changes;
-        const out = o.allocator.alloc([]u8, job.changed.items.len) catch return job.finish(error.OutOfMemory);
+        const out = o.allocator.alloc(Change, job.changed.items.len) catch return job.finish(error.OutOfMemory);
         var n: usize = 0;
-        errdefer Client.freeChanges(o.allocator, out[0..n]);
-        for (job.changed.items) |p| {
-            out[n] = o.allocator.dupe(u8, p) catch return job.finish(error.OutOfMemory);
+        for (job.changed.items) |c| {
+            const p = o.allocator.dupe(u8, c.path) catch break;
+            const op = o.allocator.dupe(u8, c.old_path) catch {
+                o.allocator.free(p);
+                break;
+            };
+            out[n] = .{ .kind = c.kind, .is_dir = c.is_dir, .path = p, .old_path = op };
             n += 1;
         }
+        if (n != out.len) {
+            Client.freeChanges(o.allocator, out[0..n]);
+            return job.finish(error.OutOfMemory);
+        }
         job.complete(.{ .changed = out });
-    }
-
-    /// Re-key everything at or beneath `from` under `to`.
-    fn moveIndex(job: *Job, from: []const u8, to: []const u8) Allocator.Error!void {
-        const client = job.client;
-        const a = client.allocator;
-        var moving: std.ArrayList([]const u8) = .empty;
-        defer moving.deinit(a);
-        var it = client.index.keyIterator();
-        while (it.next()) |key| {
-            if (std.mem.eql(u8, key.*, from) or Client.isBeneath(key.*, from)) try moving.append(a, key.*);
-        }
-        for (moving.items) |old_key| {
-            const new_key = try std.mem.concat(a, u8, &.{ to, old_key[from.len..] });
-            errdefer a.free(new_key);
-            try client.index.put(a, new_key, client.index.get(old_key).?);
-            const kv = client.index.fetchRemove(old_key).?;
-            a.free(kv.key);
-        }
     }
 };
 
@@ -1016,6 +1339,8 @@ const File = struct {
     mimeType: []const u8 = "",
     size: ?[]const u8 = null,
     modifiedTime: ?[]const u8 = null,
+    /// Only asked for by a prefetch query, which has to route each child to its folder.
+    parents: []const []const u8 = &.{},
 };
 
 const ListResponse = struct {
@@ -1027,10 +1352,13 @@ const ChangedFile = struct {
     id: []const u8 = "",
     name: []const u8 = "",
     mimeType: []const u8 = "",
+    size: ?[]const u8 = null,
+    modifiedTime: ?[]const u8 = null,
     parents: []const []const u8 = &.{},
+    trashed: bool = false,
 };
 
-const Change = struct {
+const ChangeJson = struct {
     fileId: ?[]const u8 = null,
     removed: bool = false,
     file: ?ChangedFile = null,
@@ -1041,7 +1369,7 @@ const ChangesResponse = struct {
     startPageToken: ?[]const u8 = null,
     newStartPageToken: ?[]const u8 = null,
     nextPageToken: ?[]const u8 = null,
-    changes: []const Change = &.{},
+    changes: []const ChangeJson = &.{},
 };
 
 fn parseFile(allocator: Allocator, body: []const u8) Fs.Error!std.json.Parsed(File) {
@@ -1051,15 +1379,29 @@ fn parseFile(allocator: Allocator, body: []const u8) Fs.Error!std.json.Parsed(Fi
     };
 }
 
-fn nodeFromFile(file: File, id: []u8) Node {
+/// What a listing says about `file`, with its strings copied into `arena` — or borrowed from
+/// the JSON when `arena` is null, for a caller that hands it straight to `Tree.put` (which
+/// copies what it keeps).
+fn listedFromFile(arena: ?Allocator, file: File) Allocator.Error!Tree.Listed {
     const is_folder = std.mem.eql(u8, file.mimeType, folder_mime);
     return .{
-        .id = id,
+        .name = if (arena) |ar| try ar.dupe(u8, file.name) else file.name,
+        .id = if (arena) |ar| try ar.dupe(u8, file.id) else file.id,
         .kind = if (is_folder) .dir else .file,
         .size = parseSize(file.size),
         .modified_ms = parseRfc3339Ms(file.modifiedTime),
         .google_app = !is_folder and std.mem.startsWith(u8, file.mimeType, google_apps_prefix),
     };
+}
+
+fn listedFromChanged(file: ChangedFile) Allocator.Error!Tree.Listed {
+    return listedFromFile(null, .{
+        .id = file.id,
+        .name = file.name,
+        .mimeType = file.mimeType,
+        .size = file.size,
+        .modifiedTime = file.modifiedTime,
+    });
 }
 
 fn parseSize(size: ?[]const u8) u64 {
@@ -1112,6 +1454,28 @@ fn buildListUrl(allocator: Allocator, dir_id: []const u8, page_token: ?[]const u
     try appendQueryValue(allocator, &q, dir_id);
     try appendQueryValue(allocator, &q, "' in parents and trashed=false");
     try q.appendSlice(allocator, "&fields=nextPageToken,files(" ++ file_fields ++ ")&pageSize=1000" ++ all_drives_list);
+    if (page_token) |token| {
+        try q.appendSlice(allocator, "&pageToken=");
+        try appendQueryValue(allocator, &q, token);
+    }
+    return try q.toOwnedSlice(allocator);
+}
+
+/// The children of every folder in `dirs` at once: `('a' in parents or 'b' in parents …) and
+/// trashed=false`, asking for `parents` so each child can be routed back to its folder.
+fn buildBatchUrl(allocator: Allocator, dirs: []const BatchDir, page_token: ?[]const u8) Allocator.Error![]u8 {
+    var q: std.ArrayList(u8) = .empty;
+    errdefer q.deinit(allocator);
+    try q.appendSlice(allocator, api ++ "?q=");
+    try appendQueryValue(allocator, &q, "(");
+    for (dirs, 0..) |d, i| {
+        if (i != 0) try appendQueryValue(allocator, &q, " or ");
+        try appendQueryValue(allocator, &q, "'");
+        try appendQueryValue(allocator, &q, d.id);
+        try appendQueryValue(allocator, &q, "' in parents");
+    }
+    try appendQueryValue(allocator, &q, ") and trashed=false");
+    try q.appendSlice(allocator, "&fields=nextPageToken,files(" ++ file_fields ++ ",parents)&pageSize=1000" ++ all_drives_list);
     if (page_token) |token| {
         try q.appendSlice(allocator, "&pageToken=");
         try appendQueryValue(allocator, &q, token);

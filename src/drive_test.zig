@@ -384,7 +384,7 @@ test "a rename within one folder does not move parents" {
     try std.testing.expect(std.mem.indexOf(u8, last.body, "\"name\":\"b.txt\"") != null);
 }
 
-test "changes: the first poll takes a start token, the next reports the paths it touched" {
+test "changes: the first poll takes a start token, the next folds changes into the index and reports them" {
     const a = std.testing.allocator;
     const h = try Harness.init(a, &little_drive);
     defer h.deinit();
@@ -393,36 +393,39 @@ test "changes: the first poll takes a start token, the next reports the paths it
     try settle(h.fs(), &h.sink);
 
     const Got = struct {
-        paths: ?[][]u8 = null,
+        changes: ?[]drive.Change = null,
         calls: usize = 0,
-        fn cb(ctx: ?*anyopaque, result: Fs.Error![][]u8) void {
+        fn cb(ctx: ?*anyopaque, result: Fs.Error![]drive.Change) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.calls += 1;
-            self.paths = result catch null;
+            self.changes = result catch null;
         }
     };
     var got: Got = .{};
     _ = try h.client.pollChanges(a, Got.cb, &got);
     var spins: usize = 0;
     while (got.calls == 0 and spins < 32) : (spins += 1) h.fs().pump();
-    try std.testing.expectEqual(@as(usize, 0), got.paths.?.len);
-    drive.Client.freeChanges(a, got.paths.?);
+    try std.testing.expectEqual(@as(usize, 0), got.changes.?.len);
+    drive.Client.freeChanges(a, got.changes.?);
     try std.testing.expectEqualStrings("100", h.client.changes_token.?);
 
     got = .{};
     _ = try h.client.pollChanges(a, Got.cb, &got);
     spins = 0;
     while (got.calls == 0 and spins < 32) : (spins += 1) h.fs().pump();
-    const paths = got.paths orelse return error.NoChanges;
-    defer drive.Client.freeChanges(a, paths);
-    // a.txt changed → itself and /notes; new.md appeared under root → "/".
-    try std.testing.expectEqual(@as(usize, 3), paths.len);
-    try std.testing.expectEqualStrings("/notes/a.txt", paths[0]);
-    try std.testing.expectEqualStrings("/notes", paths[1]);
-    try std.testing.expectEqualStrings("/", paths[2]);
+    const changes = got.changes orelse return error.NoChanges;
+    defer drive.Client.freeChanges(a, changes);
+    // a.txt's metadata moved → modified in place; new.md appeared under the listed root → created.
+    try std.testing.expectEqual(@as(usize, 2), changes.len);
+    try std.testing.expectEqual(drive.Change.Kind.modified, changes[0].kind);
+    try std.testing.expectEqualStrings("/notes/a.txt", changes[0].path);
+    try std.testing.expectEqual(drive.Change.Kind.created, changes[1].kind);
+    try std.testing.expectEqualStrings("/new.md", changes[1].path);
+    try std.testing.expect(!changes[1].is_dir);
     try std.testing.expectEqualStrings("101", h.client.changes_token.?);
-    // The changed file is gone from the index; its parent will be re-listed.
-    try std.testing.expect(h.client.pathOfId("a1") == null);
+    // Both are in the index now, where a listing answered from it will find them.
+    try std.testing.expectEqualStrings("/notes/a.txt", h.client.pathOfId("a1").?);
+    try std.testing.expectEqualStrings("/new.md", h.client.pathOfId("zz").?);
 }
 
 test "duplicate sibling names: first listed wins" {
@@ -624,4 +627,114 @@ test "a folder that came back as a file forgets what was beneath it" {
     try settle(h.fs(), &h.sink);
     try std.testing.expect(h.sink.err != null);
     try std.testing.expect(h.sink.stat == null);
+}
+
+// A drive for the walk: / { notes/ { a.md, sub/ { deep.md } }, more/ { b.md }, top.md }
+const walk_drive = [_]Scripted.Route{
+    .{ .contains = "q=%28%27root%27%20in%20parents%29", .body =
+        \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","parents":["root"]},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder","parents":["root"]},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3","parents":["root"]}]}
+    },
+    // Both of root's folders in one query, answered in one page.
+    .{ .contains = "q=%28%27n1%27%20in%20parents%20or%20%27m1%27%20in%20parents%29", .body =
+        \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","size":"5","parents":["n1"]},{"id":"s1","name":"sub","mimeType":"application/vnd.google-apps.folder","parents":["n1"]},{"id":"b1","name":"b.md","mimeType":"text/markdown","size":"6","parents":["m1"]}]}
+    },
+    .{ .contains = "q=%28%27s1%27%20in%20parents%29", .body =
+        \\{"files":[{"id":"d1","name":"deep.md","mimeType":"text/markdown","size":"7","parents":["s1"]}]}
+    },
+};
+
+fn settleWalk(h: *Harness) !void {
+    var rounds: usize = 0;
+    while (h.client.prefetching()) : (rounds += 1) {
+        if (rounds > 64) return error.WalkNeverFinished;
+        h.fs().pump();
+    }
+}
+
+fn countRequestsContaining(h: *Harness, needle: []const u8) usize {
+    var n: usize = 0;
+    for (h.scripted.log.items) |l| {
+        if (std.mem.indexOf(u8, l.url, needle) != null) n += 1;
+    }
+    return n;
+}
+
+test "prefetch walks the tree in batched queries, then listings answer from the index" {
+    const h = try Harness.init(std.testing.allocator, &walk_drive);
+    defer h.deinit();
+    try h.client.prefetch("/");
+    try settleWalk(h);
+    // One query per level, not one per folder: root, then notes+more together, then sub.
+    try std.testing.expectEqual(@as(usize, 3), h.scripted.log.items.len);
+    try std.testing.expectEqualStrings("/notes/sub/deep.md", h.client.pathOfId("d1").?);
+    try std.testing.expectEqualStrings("/more/b.md", h.client.pathOfId("b1").?);
+
+    // A crawler arriving now asks nothing of Drive.
+    _ = try h.fs().listDir(std.testing.allocator, "/notes", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(usize, 2), h.sink.entries.?.len);
+    try std.testing.expectEqual(@as(usize, 3), h.scripted.log.items.len);
+}
+
+test "a listing of a folder the walk has queued waits for it instead of asking twice" {
+    const h = try Harness.init(std.testing.allocator, &walk_drive);
+    defer h.deinit();
+    try h.client.prefetch("/");
+    // Asked before the walk has even reached /notes/sub.
+    _ = try h.fs().listDir(std.testing.allocator, "/notes/sub", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try settleWalk(h);
+    try std.testing.expectEqual(@as(?Fs.Error, null), h.sink.err);
+    try std.testing.expectEqual(@as(usize, 1), h.sink.entries.?.len);
+    try std.testing.expectEqualStrings("deep.md", h.sink.entries.?[0].name);
+    // Every request was a walk query; nothing listed a folder on its own.
+    try std.testing.expectEqual(h.scripted.log.items.len, countRequestsContaining(h, "q=%28"));
+}
+
+test "a refused batch is asked again in halves" {
+    const routes = [_]Scripted.Route{
+        walk_drive[0],
+        // The two-folder query is "too complex"; each folder alone is fine.
+        .{ .contains = "q=%28%27n1%27%20in%20parents%20or", .status = 400, .body = "{\"error\":{\"message\":\"The query is too complex.\"}}" },
+        .{ .contains = "q=%28%27n1%27%20in%20parents%29", .body =
+            \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","parents":["n1"]}]}
+        },
+        .{ .contains = "q=%28%27m1%27%20in%20parents%29", .body =
+            \\{"files":[{"id":"b1","name":"b.md","mimeType":"text/markdown","parents":["m1"]}]}
+        },
+    };
+    const h = try Harness.init(std.testing.allocator, &routes);
+    defer h.deinit();
+    try h.client.prefetch("/");
+    try settleWalk(h);
+    try std.testing.expectEqualStrings("/notes/a.md", h.client.pathOfId("a1").?);
+    try std.testing.expectEqualStrings("/more/b.md", h.client.pathOfId("b1").?);
+    try std.testing.expect(h.client.tree.get("/more").?.listed);
+}
+
+test "once the change feed has a token, a listed folder answers from the index" {
+    const a = std.testing.allocator;
+    const h = try Harness.init(a, &little_drive);
+    defer h.deinit();
+    _ = try h.fs().listDir(a, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    const Got = struct {
+        calls: usize = 0,
+        fn cb(ctx: ?*anyopaque, result: Fs.Error![]drive.Change) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            if (result) |c| drive.Client.freeChanges(std.testing.allocator, c) else |_| {}
+        }
+    };
+    var got: Got = .{};
+    _ = try h.client.pollChanges(a, Got.cb, &got);
+    var spins: usize = 0;
+    while (got.calls == 0 and spins < 32) : (spins += 1) h.fs().pump();
+
+    const before = h.scripted.log.items.len;
+    h.sink.reset();
+    _ = try h.fs().listDir(a, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(usize, 2), h.sink.entries.?.len);
+    try std.testing.expectEqual(before, h.scripted.log.items.len);
 }
