@@ -133,7 +133,9 @@ pub const Client = struct {
     }
 
     pub fn fs(self: *Client) Fs.Fs {
-        return .{ .ptr = self, .vtable = &vtable };
+        // `remote`: every listing here is an API call against a per-minute quota, which is what
+        // a crawler needs to know before deciding how many to have in flight.
+        return .{ .ptr = self, .vtable = &vtable, .remote = true };
     }
 
     /// Paths whose contents changed on Drive since the last poll (files the index knew about
