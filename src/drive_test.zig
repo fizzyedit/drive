@@ -587,3 +587,41 @@ test "a refusal that is not a quota is still a refusal" {
     try settle(h.fs(), &h.sink);
     try std.testing.expectEqual(@as(?Fs.Error, error.Forbidden), h.sink.err);
 }
+
+test "a folder that came back as a file forgets what was beneath it" {
+    // The crash this exists for: the same id listed again, no longer a folder. `child` was
+    // freed and *then* handed to `forgetChildren`, which read it — a segfault inside
+    // `startsWith`, reached by re-listing a drive (what "Set Root Here" does).
+    const a = std.testing.allocator;
+    const h = try Harness.init(a, &little_drive);
+    defer h.deinit();
+
+    _ = try h.fs().listDir(a, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    h.sink.reset();
+    _ = try h.fs().listDir(a, "/notes", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    h.sink.reset();
+
+    // Same id `n1`, same name, now a plain file.
+    const notes_is_a_file = [_]Scripted.Route{
+        .{ .contains = "pageToken=p2", .body = root_page2 },
+        .{ .contains = "q=%27root%27%20in%20parents", .body = 
+            \\{"nextPageToken":"p2","files":[{"id":"n1","name":"notes","mimeType":"text/plain","size":"3"}]}
+        },
+    };
+    h.scripted.routes = &notes_is_a_file;
+
+    _ = try h.fs().listDir(a, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(?Fs.Error, null), h.sink.err);
+
+    // What was beneath it is gone with it: the old child is not answered from the index any
+    // more. (It does not go back to Drive either — a path beneath a *file* cannot exist, so
+    // resolving it fails without a round trip, which is the better answer.)
+    h.sink.reset();
+    _ = try h.fs().stat("/notes/a.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expect(h.sink.err != null);
+    try std.testing.expect(h.sink.stat == null);
+}

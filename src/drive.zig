@@ -785,13 +785,18 @@ const Job = struct {
                 if (std.mem.eql(u8, node.id, file.id)) {
                     // The same file or folder as before: fresh metadata, and a folder keeps
                     // what is known beneath it.
-                    a.free(child);
                     const fresh = nodeFromFile(file, node.id);
                     node.kind = fresh.kind;
                     node.size = fresh.size;
                     node.modified_ms = fresh.modified_ms;
                     node.google_app = fresh.google_app;
-                    if (node.kind != .dir) client.forgetChildren(child);
+                    const became_file = fresh.kind != .dir;
+                    // `child` is freed *after* this, not before: `forgetChildren` reads it, and
+                    // freeing first was a use-after-free that segfaulted inside `startsWith`.
+                    // It also invalidates `node` (it removes entries from the same map), so
+                    // nothing may touch that pointer below.
+                    if (became_file) client.forgetChildren(child);
+                    a.free(child);
                     try job.noteSeen(file.name);
                     continue;
                 }
