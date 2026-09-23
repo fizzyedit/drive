@@ -65,21 +65,14 @@ const State = struct {
     phase: Phase = .signed_out,
     /// The desktop flow's listener while a browser tab is open. Native only.
     loopback: if (is_wasm) void else ?*oauth.Loopback = if (is_wasm) {} else null,
-    /// What the user picked in Google's own picker, waiting for the token that comes back
-    /// with it so the mount can be re-rooted there. Owned.
-    picked_id: []u8 = &.{},
-    /// A folder was just picked, so the mount that follows is one the user asked to open.
-    /// Separate from `mountDrive`'s `open_it`, because the pick is resolved a request earlier
-    /// than the mount and the two are joined only by this.
-    open_picked: bool = false,
     pkce: if (is_wasm) void else oauth.Pkce = if (is_wasm) {} else undefined,
     /// Web: the `state` the implicit flow must echo. Owned.
     web_state: []u8 = &.{},
     /// The one request this plugin has in flight (exchange, refresh, or the account probe).
     pending: ?vfs.http.Job = null,
 
-    /// Whether the sign-in in flight is one the user just asked for (so the picker may follow
-    /// it), rather than the silent refresh at startup.
+    /// Whether the sign-in in flight is one the user just asked for — so the drive it mounts
+    /// is one to open — rather than the silent refresh at startup.
     interactive: bool = false,
     /// Boot-clock ms when the browser was opened; a sign-in nobody finishes is abandoned
     /// after `sign_in_timeout_ms` so the option comes back on its own.
@@ -106,10 +99,6 @@ const State = struct {
         token,
         /// Token in hand; asking Drive who this is.
         account,
-        /// Signed in, but no folder picked yet — so there is nothing to mount. Under
-        /// `drive.file` this is where a fresh account sits until the picker says what
-        /// fizzy may see.
-        connected,
         mounted,
     };
 };
@@ -135,10 +124,10 @@ pub fn register(host: *sdk.Host) !void {
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "open_folder"),
         .owner = &plugin,
-        .title = "Open Drive Folder",
-        .run = cmdOpenFolder,
-        .isEnabled = cmdConnected,
-        .icon = icons.tvg.lucide.@"folder-open",
+        .title = "Open Google Drive",
+        .run = cmdOpenDrive,
+        .isEnabled = cmdMounted,
+        .icon = icons.tvg.lucide.@"hard-drive",
     });
     try host.registerCommand(.{
         .id = sdk.Plugin.commandId(plugin_id, "sign_out"),
@@ -151,7 +140,7 @@ pub fn register(host: *sdk.Host) !void {
     try host.registerOpenAction(.{
         .id = "drive.open_folder",
         .owner = &plugin,
-        .title = "Open Drive Folder",
+        .title = "Open Google Drive",
         .command = sdk.Plugin.commandId(plugin_id, "open_folder"),
         .sf_symbol = "folder.badge.gearshape",
     });
@@ -173,9 +162,9 @@ pub fn register(host: *sdk.Host) !void {
             .id = "drive.native.open_folder",
             .owner = &plugin,
             .parent_menu_id = "fizzy.menu.file",
-            .title = "Open Drive Folder",
+            .title = "Open Google Drive",
             .command = sdk.Plugin.commandId(plugin_id, "open_folder"),
-            .run = nativeOpenFolder,
+            .run = nativeOpenDrive,
         });
         try host.registerNativeMenuItem(.{
             .id = "drive.native.sign_in",
@@ -247,30 +236,19 @@ fn storeRefreshToken(value: []const u8) void {
     };
 }
 
-/// `drive.file` — the files and folders the user hands over, and nothing else.
+/// The whole drive, and it has to be.
 ///
-/// The whole drive (`scope_full`) is a *restricted* scope: publishing with it means Google's
-/// verification and an annual third-party security assessment, and until that is done a build
-/// can only be used by accounts added by hand as testers. `drive.file` is non-sensitive, so an
-/// app asking only for it publishes without review — and the picker, which now exists on the
-/// desktop as well as the web, is how the user says which folder they mean. That was the
-/// argument for full scope when this was written; it no longer holds.
+/// `drive.file` — access to what the user hands over, one item at a time — cannot support a
+/// mount: a folder picked under it grants the *folder object* alone. Its children do not list
+/// and each one 404s, so the tree opens empty. Nothing in the API makes that folder browsable,
+/// so an editor that shows a drive as a folder needs `…/auth/drive`.
 ///
-/// Whole-drive access is still available to anyone who wants it and can be a tester on their own
-/// Cloud project: `full_drive_scope` in the plugin's settings.
-fn scopeOf(st: *State) []const u8 {
-    return if (wholeDrive(st)) oauth.scope_full else oauth.scope_file;
-}
-
-/// Whether this account asks for the whole drive rather than the folders it picks.
-///
-/// The two are exclusive, and Google enforces it: the picker on the consent screen permits
-/// `drive.file` and *only* `drive.file`, so asking for the whole drive alongside it comes back
-/// `invalid_scope` — with nothing on the page to say which of the two it objected to. A
-/// whole-drive account therefore never asks for the picker: its mount is My Drive, which is
-/// what whole-drive access means.
-fn wholeDrive(st: *State) bool {
-    return st.settings.full_drive_scope.get();
+/// Google calls that restricted: until the Cloud project passes verification *and* an annual
+/// third-party security assessment, users see an "unverified app" screen (they may continue
+/// through it) and at most 100 accounts, over the project's lifetime, can grant it. That is the
+/// price of the feature, and it is the publisher's to pay — see README › Publisher setup.
+fn scopeOf(_: *State) []const u8 {
+    return oauth.scope_full;
 }
 
 fn nowMs() i64 {
@@ -294,20 +272,29 @@ fn cmdSignOut(ptr: *anyopaque) anyerror!void {
 fn cmdSignOutEnabled(ptr: *anyopaque) bool {
     return stateOf(ptr).phase != .signed_out;
 }
-fn cmdOpenFolder(ptr: *anyopaque) anyerror!void {
-    openPicker(stateOf(ptr));
+fn cmdOpenDrive(ptr: *anyopaque) anyerror!void {
+    openAsRoot(stateOf(ptr));
 }
-/// Signed in — whether or not a folder has been picked, because picking one is the thing
-/// this enables.
-fn cmdConnected(ptr: *anyopaque) bool {
-    return connected(stateOf(ptr));
+fn cmdMounted(ptr: *anyopaque) bool {
+    return mounted(stateOf(ptr));
 }
-fn connected(st: *State) bool {
-    return st.phase == .mounted or st.phase == .connected;
+fn mounted(st: *State) bool {
+    return st.phase == .mounted;
 }
 
-fn nativeOpenFolder(_: ?*anyopaque) anyerror!void {
-    openPicker(stateOf(plugin.state));
+/// Make the drive the open folder. The mount is already there — signing in put it beside the
+/// disk — so this is fizzy opening a folder it can already see, no browser and no Google UI.
+/// From there the explorer browses it like any other tree.
+fn openAsRoot(st: *State) void {
+    if (st.phase != .mounted) return;
+    sdk.host().setProjectFolder(st.prefix) catch |err| {
+        dvui.log.err("drive: could not open {s}: {t}", .{ st.prefix, err });
+        complain("Could not open your Drive as the folder.");
+    };
+}
+
+fn nativeOpenDrive(_: ?*anyopaque) anyerror!void {
+    openAsRoot(stateOf(plugin.state));
 }
 fn nativeSignIn(_: ?*anyopaque) anyerror!void {
     signIn(stateOf(plugin.state));
@@ -362,8 +349,8 @@ fn beginFrame(ptr: *anyopaque) void {
     if (st.client) |client| {
         if (client.takeUnauthorized()) stale = true;
     }
-    if (connected(st) and st.pending == null and stale) {
-        if (is_wasm) requestWebToken(st, true, false) else startRefresh(st);
+    if (mounted(st) and st.pending == null and stale) {
+        if (is_wasm) requestWebToken(st, true) else startRefresh(st);
     }
 }
 
@@ -386,31 +373,31 @@ fn signIn(st: *State) void {
         st.phase = .token;
         // Connect and choose in one trip, as on the desktop: `drive.file` gives an account
         // with nothing picked no view of anything.
-        requestWebToken(st, false, !wholeDrive(st));
+        requestWebToken(st, false);
         return;
     }
     if (credentials.client_id.len == 0) return complain("This build of the Drive plugin has no OAuth client configured.");
     // Connecting and choosing a folder are one trip to the browser: under `drive.file` an
     // account with nothing picked can see nothing, so there is no useful stop in between.
-    startDesktopFlow(st, !wholeDrive(st)) catch |err| {
+    startDesktopFlow(st) catch |err| {
         dvui.log.err("drive: could not start sign-in: {t}", .{err});
         complain("Could not start Google sign-in; see the log.");
     };
 }
 
-fn startDesktopFlow(st: *State, pick: bool) !void {
+fn startDesktopFlow(st: *State) !void {
     if (is_wasm) return error.Unsupported;
     const gpa = sdk.allocator();
     st.pkce = oauth.Pkce.generate(dvui.io);
     const loopback = try oauth.Loopback.start(gpa, dvui.io, st.pkce.state, .{});
     errdefer loopback.stop();
-    const url = try oauth.authUrl(gpa, credentials.client_id, scopeOf(st), loopback.port(), &st.pkce, pick);
+    const url = try oauth.authUrl(gpa, credentials.client_id, scopeOf(st), loopback.port(), &st.pkce);
     defer gpa.free(url);
     if (!dvui.openURL(.{ .url = url })) return error.CouldNotOpenBrowser;
     st.loopback = loopback;
     st.phase = .awaiting_code;
     st.awaiting_since_ms = nowMs();
-    dvui.toast(@src(), .{ .message = if (pick) "Choose a Drive folder in your browser." else "Finish signing in to Google in your browser." });
+    dvui.toast(@src(), .{ .message = "Finish signing in to Google in your browser." });
 }
 
 fn pollLoopback(st: *State) void {
@@ -436,120 +423,16 @@ fn pollLoopback(st: *State) void {
             };
             const code = oauth.decode(gpa, raw) catch return fail(st, "out of memory");
             defer gpa.free(code);
-            takePickedId(st, query);
             startExchange(st, code, port);
         },
     }
 }
 
-// ---- the folder picker ----------------------------------------------------------------------
-//
-// Two pickers, because Google has two. The web build runs Google's JavaScript Picker widget in
-// a popup, which is judged by the origin it runs on — fine for a real site, registered on the
-// web client. An installed app has no such origin, so the desktop uses Google's picker for
-// installed apps instead: `trigger_onepick` on the consent screen, with the chosen ids coming
-// back on the OAuth redirect. Either way the mount ends up re-rooted at what was picked.
-
-fn openPicker(st: *State) void {
-    if (st.phase != .mounted and st.phase != .connected) return;
-    if (wholeDrive(st)) return complain("\"Access the whole Drive\" is on, so the mount is all of My Drive — there is no folder to pick. Turn it off in the Google Drive settings to choose folders instead.");
-    if (st.phase == .awaiting_code) return complain("A Google window is already open.");
-    // Google's picker for apps that cannot host its JavaScript widget: it lives inside the
-    // consent screen, so choosing a folder is another (short) trip through OAuth, and the ids
-    // come back on the redirect. The desktop cannot host the widget because a loopback listener
-    // has no registrable origin; the web build cannot because fizzy opens a plugin's page as a
-    // blob: document, and the Picker refuses to run in one (a bare 403 in the popup). Under
-    // `drive.file` the grant and the choice are the same act anyway, so this is the honest shape
-    // for both.
-    if (is_wasm) {
-        st.web_state = blk: {
-            const gpa = sdk.allocator();
-            if (st.web_state.len != 0) gpa.free(st.web_state);
-            break :blk &.{};
-        };
-        requestWebToken(st, false, !wholeDrive(st));
-        return;
-    }
-    startDesktopFlow(st, !wholeDrive(st)) catch |err| {
-        dvui.log.err("drive: could not open the folder picker: {t}", .{err});
-        complain("Could not open your browser for the folder picker.");
-    };
-}
-
-/// The first id from the redirect's `picked_file_ids`, kept until the exchange that follows it
-/// lands. Absent means this was a plain sign-in.
-fn takePickedId(st: *State, query: []const u8) void {
-    takePickedIds(st, oauth.queryParam(query, "picked_file_ids") orelse return);
-}
-
-/// `picked_file_ids` as Google sends it, still percent-encoded.
-fn takePickedIds(st: *State, raw: []const u8) void {
-    const gpa = sdk.allocator();
-    const ids = oauth.decode(gpa, raw) catch return;
-    defer gpa.free(ids);
-    // One folder is one root; a multi-select we never asked for takes the first.
-    const first = ids[0 .. std.mem.indexOfScalar(u8, ids, ',') orelse ids.len];
-    if (first.len == 0) return;
-    const copy = gpa.dupe(u8, first) catch return;
-    if (st.picked_id.len != 0) gpa.free(st.picked_id);
-    st.picked_id = copy;
-}
-
-/// The picked folder's name, asked for as soon as there is a token that may see it: it names
-/// the mount (`gdrive://<account>/<name>`), and the picker only hands back an id.
-fn resolvePicked(st: *State) void {
-    const gpa = sdk.allocator();
-    var auth_buf: [2100]u8 = undefined;
-    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{st.access_token}) catch return fail(st, "token too long");
-    const url = std.fmt.allocPrint(gpa, "https://www.googleapis.com/drive/v3/files/{s}?fields=name&supportsAllDrives=true", .{st.picked_id}) catch return fail(st, "out of memory");
-    defer gpa.free(url);
-    st.pending = st.transport.request(gpa, .{
-        .method = .GET,
-        .url = url,
-        .headers = &.{.{ .name = "Authorization", .value = auth }},
-    }, onPickedName, st) catch return fail(st, "could not reach Google Drive");
-}
-
-fn onPickedName(ctx: ?*anyopaque, result: vfs.Error!vfs.http.Response) void {
-    const st: *State = @ptrCast(@alignCast(ctx.?));
-    st.pending = null;
-    comeBack();
-    const gpa = sdk.allocator();
-    const id = st.picked_id;
-    st.picked_id = &.{};
-    defer gpa.free(id);
-
-    const resp = result catch return fail(st, "could not reach Google Drive");
-    defer resp.deinit(gpa);
-    if (resp.status != 200) {
-        dvui.log.err("drive: files.get {s}: HTTP {d}: {s}", .{ id, resp.status, resp.body });
-        return fail(st, "Google Drive would not open the folder you chose");
-    }
-    const parsed = std.json.parseFromSlice(struct { name: []const u8 = "" }, gpa, resp.body, .{ .ignore_unknown_fields = true }) catch
-        return fail(st, "unexpected reply from Google Drive");
-    defer parsed.deinit();
-    const name = parsed.value.name;
-
-    // Picking a folder *is* asking for it: whichever way it gets mounted below, it opens.
-    // Without this a pick that arrived before the account was known (the whole first sign-in,
-    // where the exchange leaves `phase` at `.token`) mounted the folder and opened nothing,
-    // with no message either — the picker said "return to fizzy" and fizzy showed no change.
-    st.open_picked = true;
-
-    // Already know whose drive this is → swap the mount's root. Otherwise this is the first
-    // connect: record the choice and let the account lookup mount it.
-    if (connected(st) and st.account.len != 0) return remount(st, id, name);
-    setSetting(st, "root_folder_id", id);
-    setSetting(st, "root_folder_name", name);
-    askWhoThisIs(st);
-}
-
-
 /// Tear the mount down and bring it up again rooted at `folder_id` (`"root"` for My Drive),
 /// which becomes the open folder. The account and token stay; only the mount changes — and
 /// with it the prefix, so a folder's files are `gdrive://<account>/<folder>/…`.
 fn remount(st: *State, folder_id: []const u8, folder_name: []const u8) void {
-    if (st.phase != .mounted and st.phase != .connected) return;
+    if (st.phase != .mounted) return;
     const gpa = sdk.allocator();
     const email = gpa.dupe(u8, st.account) catch return;
     defer gpa.free(email);
@@ -645,8 +528,7 @@ fn setToken(st: *State, token: []const u8, expires_in: i64) void {
 /// the token that can see it is this one). Mounted already (a refresh) → nothing more;
 /// otherwise find out whose drive this is.
 fn afterToken(st: *State) void {
-    if (st.picked_id.len != 0) return resolvePicked(st);
-    if (st.phase == .mounted or st.phase == .connected) return;
+    if (st.phase == .mounted) return;
     askWhoThisIs(st);
 }
 
@@ -726,7 +608,7 @@ fn providerAccounts(ctx: ?*anyopaque, arena: std.mem.Allocator) []const sdk.acco
     const st: *State = @ptrCast(@alignCast(ctx.?));
     // Connected counts: the rail disc is how the user reaches the folder picker, and with
     // nothing picked yet that is the only thing to do.
-    if (!connected(st)) return &.{};
+    if (!mounted(st)) return &.{};
     const one = arena.alloc(sdk.accounts.Account, 1) catch return &.{};
     one[0] = .{ .id = st.account, .label = st.account, .avatar = st.avatar };
     return one;
@@ -742,8 +624,8 @@ fn providerSignIn(ctx: ?*anyopaque) void {
 fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
     const st: *State = @ptrCast(@alignCast(ctx.?));
     const host = sdk.host();
-    if (host.drawMenuItem("Open Drive Folder", sdk.Plugin.commandId(plugin_id, "open_folder"))) {
-        openPicker(st);
+    if (host.drawMenuItem("Open Google Drive", sdk.Plugin.commandId(plugin_id, "open_folder"))) {
+        openAsRoot(st);
         return true;
     }
     if (host.drawMenuItem("Sign out", sdk.Plugin.commandId(plugin_id, "sign_out"))) {
@@ -755,9 +637,11 @@ fn providerMenu(ctx: ?*anyopaque, _: []const u8) bool {
 
 fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
     const gpa = sdk.allocator();
-    const open_it = open_it_arg or st.open_picked;
-    st.open_picked = false;
-    // A re-pick arrives while a mount is already up under the old root, and its prefix is a
+    // A sign-in the user just asked for opens the drive; the silent restore at startup only
+    // mounts it, so a recent `gdrive://` path resolves without the drive taking over the window.
+    const open_it = open_it_arg or st.interactive;
+    st.interactive = false;
+    // A re-root arrives while a mount is already up under the old one, and its prefix is a
     // different string — so without this the old one would stay mounted beside the new.
     if (st.client) |client| {
         if (st.poll) |job| {
@@ -773,29 +657,10 @@ fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
     }
     const account = try gpa.dupe(u8, email);
     errdefer gpa.free(account);
-    // My Drive is `gdrive://<account>`; a picked folder is named after itself, so its paths
-    // read like paths.
+    // My Drive is `gdrive://<account>`; a drive re-rooted at one folder is named after it, so
+    // its paths read like paths.
     const root_id = st.settings.root_folder_id.get();
     const root_name = st.settings.root_folder_name.get();
-
-    // Nothing picked yet. Under `drive.file` there is no whole drive to stand in for it —
-    // "root" lists nothing and answers NotFound — so the account is simply connected, and the
-    // picker is what gives it something to show. (`full_drive_scope` keeps "root" = My Drive.)
-    if (std.mem.eql(u8, root_id, "root") and !st.settings.full_drive_scope.get()) {
-        if (st.account.len != 0) gpa.free(st.account);
-        st.account = account;
-        st.phase = .connected;
-        setSetting(st, "account", email);
-        // On a sign-in the user just asked for, go straight on to choosing a folder; on the
-        // silent restore at startup, don't open a browser tab nobody asked for.
-        if (st.interactive) openPicker(st) else {
-            const msg = std.fmt.allocPrint(sdk.host().arena(), "Google Drive connected as {s}. Open a Drive folder to choose what fizzy can see.", .{email}) catch "Google Drive connected.";
-            dvui.toast(@src(), .{ .message = msg });
-        }
-        st.interactive = false;
-        sdk.refresh();
-        return;
-    }
 
     const prefix = if (std.mem.eql(u8, root_id, "root") or root_name.len == 0)
         try std.fmt.allocPrint(gpa, "gdrive://{s}", .{email})
@@ -867,8 +732,6 @@ fn signOut(st: *State, forget: bool) void {
             st.loopback = null;
         }
     }
-    if (st.picked_id.len != 0) gpa.free(st.picked_id);
-    st.picked_id = &.{};
     if (st.client) |client| {
         sdk.host().unmount(st.prefix);
         client.deinit();
@@ -907,7 +770,7 @@ fn fail(st: *State, what: []const u8) void {
     // A refresh that fails while mounted (the network, a 5xx) leaves the mount up with its old
     // token and is retried in a minute — not next frame, which was one token POST per frame.
     // Anything earlier in the flow starts over.
-    if (st.phase == .mounted or st.phase == .connected) {
+    if (st.phase == .mounted) {
         st.expires_at_ms = nowMs() + 120_000 + 60_000;
         return;
     }
@@ -948,7 +811,7 @@ fn setSetting(st: *State, comptime field: []const u8, value: []const u8) void {
 // token in the fragment. Nothing Google-specific lives in fizzy for this; the popup helper is
 // the same one any provider's plugin would use.
 
-fn requestWebToken(st: *State, silent: bool, pick: bool) void {
+fn requestWebToken(st: *State, silent: bool) void {
     if (!is_wasm) return;
     const gpa = sdk.allocator();
     const redirect = core.transport.WebOAuth.callbackUrl(gpa) catch return fail(st, "no callback page");
@@ -960,7 +823,7 @@ fn requestWebToken(st: *State, silent: bool, pick: bool) void {
         _ = std.base64.url_safe_no_pad.Encoder.encode(state_buf, &nonce);
         st.web_state = state_buf;
     }
-    const url = oauth.implicitAuthUrl(gpa, credentials.web_client_id, scopeOf(st), redirect, st.web_state, silent, pick) catch return fail(st, "out of memory");
+    const url = oauth.implicitAuthUrl(gpa, credentials.web_client_id, scopeOf(st), redirect, st.web_state, silent) catch return fail(st, "out of memory");
     defer gpa.free(url);
     core.transport.WebOAuth.begin(gpa, url, onWebOAuth, st) catch return fail(st, "a sign-in is already open");
 }
@@ -973,7 +836,6 @@ fn onWebOAuth(ctx: ?*anyopaque, result: ?[]u8) void {
     defer gpa.free(text);
     const parsed = oauth.parseImplicit(text) orelse return fail(st, "Google refused the sign-in");
     if (!std.mem.eql(u8, parsed.state, st.web_state)) return fail(st, "sign-in reply did not match the request");
-    if (parsed.picked_file_ids) |ids| takePickedIds(st, ids);
     setToken(st, parsed.access_token, parsed.expires_in);
     afterToken(st);
 }

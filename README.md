@@ -3,14 +3,15 @@
 Sign in to Google Drive and it appears in the explorer as a folder (`gdrive://<account>`):
 browse, open, edit, save, create, rename, delete, search — on the desktop and in the web build.
 
-Users click **File › Connect Google Drive…**, sign in on Google's page, and are back in fizzy
-with the drive mounted. Nothing below is for them. It is the **one-time registration of fizzy
+Users click **File › Connect Google Drive…**, sign in on Google's page once, and are back in
+fizzy with the drive mounted and open. Everything after that — browsing, choosing which folder
+to work in — happens in fizzy. Nothing below is for them. It is the **one-time registration of fizzy
 as an app with Google**, done by whoever publishes fizzy; the result is two public client IDs
 that become defaults in this plugin's settings.
 
 This is an ordinary third-party plugin (the same shape as pixi): fizzy knows nothing about
-Google. Natively it ships through the plugin store; the web build links it in because a
-browser cannot load plugins at runtime (`web_plugin_dirs` in fizzy's `build.zig`).
+Google. Natively it ships through the plugin store; the web build installs it from that same
+store, as a wasm side module the page links at runtime.
 
 ## Install (development)
 
@@ -35,9 +36,8 @@ All of it happens in the [Google Cloud console](https://console.cloud.google.com
 ### 2. Enable the Drive API
 
 **APIs & Services › Library** → search *Google Drive API* → **Enable**. Without this every
-call fails with "API not enabled". Nothing else needs enabling: the folder chooser is the
-picker Google draws inside its own consent screen (`trigger_onepick`), not the Picker API's
-JavaScript widget, so there is no Picker API, no API key and no project number to configure.
+call fails with "API not enabled". Nothing else needs enabling — no Picker API, no API key, no
+project number: the drive is browsed inside fizzy, not through a Google widget.
 
 ### 3. The consent screen
 
@@ -46,19 +46,23 @@ console).
 
 - User type: **External**.
 - App name `fizzy`, your email as user-support and developer contact. Logo/links optional.
-- **Scopes** → *Add or remove scopes* → tick `https://www.googleapis.com/auth/drive.file`
-  ("See, edit, create and delete only the specific Google Drive files you use with this app").
-  That is the only scope the plugin asks for, and the folder picker is how the user says which
-  folder they mean — picking a folder in the consent screen is what hands the app access to it.
-- **Do not add `…/auth/drive`.** The whole drive is a *restricted* scope: an app requesting it
-  can only sign in accounts listed as test users until the Cloud project passes Google's
-  verification *and* an annual third-party security assessment. `drive.file` is non-sensitive,
-  so nothing is reviewed and there is no test-user cap. The plugin can still ask for the whole
-  drive — *Access the whole Drive* in its settings — which is for people running it against
-  their own Cloud project, not for a published build.
-- **Test users** → add your own Google account while the *Publishing status* is **Testing**.
-  With only `drive.file` requested you can press **Publish app** whenever you like; it takes
-  effect immediately, with no review.
+- **Scopes** → *Add or remove scopes* → tick `https://www.googleapis.com/auth/drive`
+  ("See, edit, create and delete all of your Google Drive files"). It is the only scope the
+  plugin asks for, and it has to be this one: `drive.file` grants access an item at a time, and
+  a folder granted that way hands over the *folder object* alone — its children do not list and
+  each one 404s, so the tree opens empty. A drive you can browse is a drive you have access to.
+- **What that costs, plainly.** Google calls `…/auth/drive` *restricted*. Until the project
+  passes verification **and** an annual third-party security assessment (CASA Tier 2):
+  - users see an **unverified app** screen before the consent screen. They can continue through
+    *Advanced*, and everything works afterwards — it is a warning, not a block;
+  - at most **100 accounts, ever**, can grant it. The cap is per project, counts for the
+    project's lifetime and cannot be reset or raised without verification.
+
+  That is fine for a plugin among friends and for anyone building it against their own Cloud
+  project. It is the thing to fix before a build is handed to a large audience.
+- **Test users** → while *Publishing status* is **Testing**, only accounts listed here can sign
+  in at all. Pressing **Publish app** moves to *In production*, where any account may sign in,
+  still unverified, still under the 100-account cap.
 
 ### 4. Two OAuth clients
 
@@ -96,10 +100,13 @@ file is missing.
 
 ## What users see
 
-The whole drive as a folder, `gdrive://<account>`. **File › Open Google Drive Folder…** (also
-in the account menu at the bottom of the rail) opens Google's folder picker in the browser;
-the chosen folder — shared ones included — becomes the root, `gdrive://<account>/<folder>`.
-**Open Google Drive** goes back to the whole drive.
+The whole drive as a folder, `gdrive://<account>`. Connecting mounts it and opens it, and from
+there it is browsed in fizzy's own tree like any other folder — no browser, no Google UI, no
+re-consent. **File › Open Google Drive** (also in the account menu at the bottom of the rail)
+opens it again after you have opened something else.
+
+A subfolder can be the root instead — `root_folder_id` in the plugin's settings, which names it
+`gdrive://<account>/<folder>`. Nothing in the UI sets that yet.
 
 ## How it works
 
