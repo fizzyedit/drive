@@ -1,8 +1,8 @@
 .{
     .id = "drive",
     .name = "Google Drive",
-    .version = "0.1.3",
-    .min_sdk_version = "0.2.2",
+    .version = "0.1.4",
+    .min_sdk_version = "0.2.3",
     .description = "Sign in to Google Drive and browse, open and edit it in the explorer like a folder",
     .tags = .{ "cloud", "drive", "mount" },
     .author = "foxnne",
