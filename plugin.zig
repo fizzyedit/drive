@@ -255,7 +255,18 @@ fn storeRefreshToken(value: []const u8) void {
 /// Whole-drive access is still available to anyone who wants it and can be a tester on their own
 /// Cloud project: `full_drive_scope` in the plugin's settings.
 fn scopeOf(st: *State) []const u8 {
-    return if (st.settings.full_drive_scope.get()) oauth.scope_full else oauth.scope_file;
+    return if (wholeDrive(st)) oauth.scope_full else oauth.scope_file;
+}
+
+/// Whether this account asks for the whole drive rather than the folders it picks.
+///
+/// The two are exclusive, and Google enforces it: the picker on the consent screen permits
+/// `drive.file` and *only* `drive.file`, so asking for the whole drive alongside it comes back
+/// `invalid_scope` — with nothing on the page to say which of the two it objected to. A
+/// whole-drive account therefore never asks for the picker: its mount is My Drive, which is
+/// what whole-drive access means.
+fn wholeDrive(st: *State) bool {
+    return st.settings.full_drive_scope.get();
 }
 
 fn nowMs() i64 {
@@ -371,13 +382,13 @@ fn signIn(st: *State) void {
         st.phase = .token;
         // Connect and choose in one trip, as on the desktop: `drive.file` gives an account
         // with nothing picked no view of anything.
-        requestWebToken(st, false, true);
+        requestWebToken(st, false, !wholeDrive(st));
         return;
     }
     if (credentials.client_id.len == 0) return complain("This build of the Drive plugin has no OAuth client configured.");
     // Connecting and choosing a folder are one trip to the browser: under `drive.file` an
     // account with nothing picked can see nothing, so there is no useful stop in between.
-    startDesktopFlow(st, true) catch |err| {
+    startDesktopFlow(st, !wholeDrive(st)) catch |err| {
         dvui.log.err("drive: could not start sign-in: {t}", .{err});
         complain("Could not start Google sign-in; see the log.");
     };
@@ -437,6 +448,7 @@ fn pollLoopback(st: *State) void {
 
 fn openPicker(st: *State) void {
     if (st.phase != .mounted and st.phase != .connected) return;
+    if (wholeDrive(st)) return complain("\"Access the whole Drive\" is on, so the mount is all of My Drive — there is no folder to pick. Turn it off in the Google Drive settings to choose folders instead.");
     if (st.phase == .awaiting_code) return complain("A Google window is already open.");
     // Google's picker for apps that cannot host its JavaScript widget: it lives inside the
     // consent screen, so choosing a folder is another (short) trip through OAuth, and the ids
@@ -451,10 +463,10 @@ fn openPicker(st: *State) void {
             if (st.web_state.len != 0) gpa.free(st.web_state);
             break :blk &.{};
         };
-        requestWebToken(st, false, true);
+        requestWebToken(st, false, !wholeDrive(st));
         return;
     }
-    startDesktopFlow(st, true) catch |err| {
+    startDesktopFlow(st, !wholeDrive(st)) catch |err| {
         dvui.log.err("drive: could not open the folder picker: {t}", .{err});
         complain("Could not open your browser for the folder picker.");
     };

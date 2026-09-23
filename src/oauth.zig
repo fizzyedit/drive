@@ -67,11 +67,20 @@ pub fn redirectUri(buf: *[40]u8, port: u16) []const u8 {
 pub fn implicitAuthUrl(allocator: std.mem.Allocator, client_id: []const u8, scope: []const u8, redirect_uri: []const u8, state: []const u8, silent: bool, pick: bool) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, auth_endpoint ++ "?response_type=token&include_granted_scopes=true");
+    try out.appendSlice(allocator, auth_endpoint ++ "?response_type=token");
     if (silent) try out.appendSlice(allocator, "&prompt=none");
     // Same picker the desktop uses (`authUrl`), and it answers an implicit grant too: the ids
     // come back on the redirect beside the token. `prompt=consent` is required with it.
-    if (pick) try out.appendSlice(allocator, "&prompt=consent&trigger_onepick=true&allow_folder_selection=true");
+    //
+    // `include_granted_scopes` is deliberately *absent* with the picker. It asks Google to fold
+    // in every scope this account granted before, and the picker permits `drive.file` and
+    // nothing else — so an account that once granted whole-drive access (a developer's own, in
+    // particular) gets its old grant added back and the request refused as `invalid_scope`,
+    // with nothing on the error page naming the scope it disliked.
+    if (pick)
+        try out.appendSlice(allocator, "&prompt=consent&trigger_onepick=true&allow_folder_selection=true")
+    else
+        try out.appendSlice(allocator, "&include_granted_scopes=true");
     try appendParam(allocator, &out, "client_id", client_id);
     try appendParam(allocator, &out, "redirect_uri", redirect_uri);
     try appendParam(allocator, &out, "scope", scope);
