@@ -186,7 +186,7 @@ const Harness = struct {
     fn init(allocator: Allocator, rs: []const Scripted.Route) !*Harness {
         const h = try allocator.create(Harness);
         h.scripted = Scripted.init(allocator, rs);
-        h.client = try drive.Client.init(allocator, h.scripted.transport(), "token", "root");
+        h.client = try drive.Client.init(allocator, std.testing.io, h.scripted.transport(), "token", "root");
         h.sink = .{ .allocator = allocator };
         return h;
     }
@@ -468,4 +468,122 @@ test "cancel mid-flight: no callback, no leak" {
     var i: usize = 0;
     while (i < 8) : (i += 1) h.fs().pump();
     try std.testing.expectEqual(@as(usize, 0), h.sink.calls);
+}
+
+test "re-listing an ancestor while a deeper listing is in flight does not fail it" {
+    // What a vault scan meets: it lists `/notes` while the file tree re-lists `/`.
+    const h = try Harness.init(std.testing.allocator, &little_drive);
+    defer h.deinit();
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    h.sink.reset();
+
+    var deep: Sink = .{ .allocator = std.testing.allocator };
+    defer deep.reset();
+    _ = try h.fs().listDir(std.testing.allocator, "/notes", Sink.onList, &deep);
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &deep);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(?Fs.Error, null), deep.err);
+    try std.testing.expectEqual(@as(usize, 2), deep.entries.?.len);
+    try std.testing.expectEqual(@as(usize, 2), h.sink.entries.?.len);
+
+    // And what the deeper listing learned survived the root's re-list: no request for this.
+    const before = h.scripted.log.items.len;
+    h.sink.reset();
+    _ = try h.fs().stat("/notes/a.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(u64, 7), h.sink.stat.?.size);
+    try std.testing.expectEqual(before, h.scripted.log.items.len);
+}
+
+test "a re-list drops children that are gone and keeps a surviving folder's subtree" {
+    const h = try Harness.init(std.testing.allocator, &little_drive);
+    defer h.deinit();
+    _ = try h.fs().stat("/notes/a.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+
+    // `top.txt` is gone and `notes` is a different folder under the same name … then the
+    // same folder again, with `top.txt` back.
+    const replaced = [_]Scripted.Route{
+        .{ .contains = "q=%27root%27%20in%20parents", .body =
+            \\{"files":[{"id":"n2","name":"notes","mimeType":"application/vnd.google-apps.folder"}]}
+        },
+    };
+    const same = [_]Scripted.Route{
+        .{ .contains = "q=%27root%27%20in%20parents", .body =
+            \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","modifiedTime":"2024-03-01T00:00:00Z"},{"id":"t1","name":"top.txt","mimeType":"text/plain","size":"9"}]}
+        },
+    };
+
+    // Same folder: its subtree stays, its metadata refreshes.
+    h.scripted.routes = &same;
+    h.sink.reset();
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    const after_same = h.scripted.log.items.len;
+    h.sink.reset();
+    _ = try h.fs().stat("/notes/a.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(u64, 7), h.sink.stat.?.size);
+    try std.testing.expectEqual(after_same, h.scripted.log.items.len);
+    h.sink.reset();
+    _ = try h.fs().stat("/top.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(u64, 9), h.sink.stat.?.size);
+
+    // A different folder under the name, and `top.txt` gone.
+    h.scripted.routes = &replaced;
+    h.sink.reset();
+    _ = try h.fs().listDir(std.testing.allocator, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(usize, 1), h.sink.entries.?.len);
+    h.sink.reset();
+    _ = try h.fs().stat("/top.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(Fs.Error.NotFound, h.sink.err.?);
+    // The old folder's children went with it: this has to ask Drive about `n2`.
+    h.sink.reset();
+    _ = try h.fs().stat("/notes/a.txt", Sink.onStat, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(Fs.Error.NotFound, h.sink.err.?);
+    try std.testing.expect(std.mem.indexOf(u8, h.scripted.url(h.scripted.log.items.len - 1), "n2") != null);
+}
+
+/// Google's body for a spent per-minute quota, trimmed to what the classifier reads.
+const quota_body =
+    \\{"error":{"code":403,"message":"Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user'","errors":[{"message":"Quota exceeded","domain":"usageLimits","reason":"rateLimitExceeded"}]}}
+;
+
+test "a spent quota is retried, not reported as a refusal" {
+    // The failure this exists for: a recursive crawl of a real drive spends Drive's per-minute
+    // query cost in seconds, and every 403 that followed used to surface as Forbidden — the
+    // mount looked permission-broken for the rest of the session over something that fixes
+    // itself in a moment.
+    const a = std.testing.allocator;
+    const h = try Harness.init(a, &.{
+        .{ .contains = "files?q=", .status = 403, .body = quota_body },
+    });
+    defer h.deinit();
+
+    _ = try h.fs().listDir(a, "/", Sink.onList, &h.sink);
+    // Several pumps: the retry is on a clock, so nothing comes back in the first few.
+    var rounds: usize = 0;
+    while (h.sink.calls == 0 and rounds < 8) : (rounds += 1) h.fs().pump();
+    try std.testing.expectEqual(@as(usize, 0), h.sink.calls);
+    try std.testing.expect(h.client.quiet_until_ms > 0);
+}
+
+test "a refusal that is not a quota is still a refusal" {
+    const a = std.testing.allocator;
+    const h = try Harness.init(a, &.{
+        .{ .contains = "files?q=", .status = 403, .body = 
+            \\{"error":{"code":403,"message":"Insufficient permission","errors":[{"reason":"insufficientPermissions"}]}}
+        },
+    });
+    defer h.deinit();
+
+    _ = try h.fs().listDir(a, "/", Sink.onList, &h.sink);
+    try settle(h.fs(), &h.sink);
+    try std.testing.expectEqual(@as(?Fs.Error, error.Forbidden), h.sink.err);
 }

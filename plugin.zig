@@ -84,12 +84,20 @@ const State = struct {
     /// `gdrive://<account>` while mounted. Owned.
     prefix: []u8 = &.{},
     client: ?*drive.Client = null,
+    /// Clients already unmounted but not yet freed, and how many frames each has waited. A
+    /// plugin reading the old mount (atlas's vault scan) holds its `Fs` until the host closes
+    /// or replaces the folder, which lands in the same frame (a re-root's `setProjectFolder`)
+    /// or at the top of the next (the close an unmount queues). Freeing at once had that
+    /// plugin cancel its jobs into freed memory.
+    retired: std.ArrayListUnmanaged(Retired) = .empty,
     /// The `changes.list` poll: when it last ran, and whether one is in flight.
     last_poll_ms: i64 = 0,
     poll: ?vfs.Job = null,
     /// The account's profile picture, once fetched. Owned pixels (freed with the source).
     avatar: ?dvui.ImageSource = null,
     avatar_job: ?vfs.http.Job = null,
+
+    const Retired = struct { client: *drive.Client, frames: u8 = 0 };
 
     const Phase = enum {
         signed_out,
@@ -214,6 +222,7 @@ fn deinit(ptr: *anyopaque) void {
     const st = stateOf(ptr);
     const gpa = sdk.allocator();
     signOut(st, false);
+    freeRetired(st, true);
     if (!is_wasm and st.ready) st.native_transport.deinit();
     Schema.deinit(&st.settings);
     gpa.destroy(st);
@@ -321,6 +330,7 @@ fn drawFileMenuSection(_: ?*anyopaque) anyerror!void {
 fn beginFrame(ptr: *anyopaque) void {
     const st = stateOf(ptr);
     if (!st.ready) return;
+    freeRetired(st, false);
     // Own requests land here; once mounted the table pumps the same transport too, which is
     // harmless — a completion is delivered once.
     st.transport.pump();
@@ -442,12 +452,7 @@ fn remount(st: *State, folder_id: []const u8, folder_name: []const u8) void {
         if (st.client) |client| client.fs().cancel(job);
         st.poll = null;
     }
-    if (st.client) |client| {
-        sdk.host().unmount(st.prefix);
-        client.deinit();
-        gpa.destroy(client);
-        st.client = null;
-    }
+    releaseClient(st);
     if (st.prefix.len != 0) gpa.free(st.prefix);
     st.prefix = &.{};
     st.phase = .account;
@@ -648,10 +653,7 @@ fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
             client.fs().cancel(job);
             st.poll = null;
         }
-        sdk.host().unmount(st.prefix);
-        client.deinit();
-        gpa.destroy(client);
-        st.client = null;
+        releaseClient(st);
         if (st.prefix.len != 0) gpa.free(st.prefix);
         st.prefix = &.{};
     }
@@ -669,7 +671,7 @@ fn mountDrive(st: *State, email: []const u8, open_it_arg: bool) !void {
     errdefer gpa.free(prefix);
     const client = try gpa.create(drive.Client);
     errdefer gpa.destroy(client);
-    client.* = try drive.Client.init(gpa, st.transport, st.access_token, root_id);
+    client.* = try drive.Client.init(gpa, dvui.io, st.transport, st.access_token, root_id);
     errdefer client.deinit();
     try sdk.host().mount(prefix, client.fs());
 
@@ -732,12 +734,7 @@ fn signOut(st: *State, forget: bool) void {
             st.loopback = null;
         }
     }
-    if (st.client) |client| {
-        sdk.host().unmount(st.prefix);
-        client.deinit();
-        gpa.destroy(client);
-        st.client = null;
-    }
+    releaseClient(st);
     if (st.prefix.len != 0) gpa.free(st.prefix);
     st.prefix = &.{};
     if (st.access_token.len != 0) gpa.free(st.access_token);
@@ -762,6 +759,37 @@ fn signOut(st: *State, forget: bool) void {
         setSetting(st, "root_folder_name", "");
     }
     sdk.refresh();
+}
+
+/// Unmount the client and retire it: freed by `freeRetired` once whoever read the mount has
+/// let go of it.
+fn releaseClient(st: *State) void {
+    const client = st.client orelse return;
+    st.client = null;
+    sdk.host().unmount(st.prefix);
+    st.retired.append(sdk.allocator(), .{ .client = client }) catch destroyClient(client);
+}
+
+fn destroyClient(client: *drive.Client) void {
+    client.deinit();
+    sdk.allocator().destroy(client);
+}
+
+/// Once a frame; `all` at teardown. A client waits out the frame it was retired in and the
+/// next, whose start is where the host applies a queued folder close.
+fn freeRetired(st: *State, all: bool) void {
+    var i: usize = 0;
+    while (i < st.retired.items.len) {
+        const r = &st.retired.items[i];
+        if (all or r.frames >= 1) {
+            destroyClient(r.client);
+            _ = st.retired.swapRemove(i);
+            continue;
+        }
+        r.frames += 1;
+        i += 1;
+    }
+    if (all) st.retired.deinit(sdk.allocator());
 }
 
 fn fail(st: *State, what: []const u8) void {

@@ -11,8 +11,10 @@
 //! one whole-drive `files.list` because it behaves the same under every scope — with
 //! `drive.file` and a picked folder, descendants are not guaranteed to be granted.
 //!
-//! `listDir` always refetches (the consumer is a cache calling on a miss); everything else
-//! trusts the index. A host that learns of an outside change (`changes.list`, later) calls
+//! `listDir` always refetches (the consumer is a cache calling on a miss) and reconciles the
+//! directory's children against the answer — what survives keeps its subtree, so a re-list
+//! never pulls paths out from under other ops in flight beneath it; everything else trusts
+//! the index. A host that learns of an outside change (`changes.list`, later) calls
 //! `forget(path)`.
 //!
 //! ## Every op is a small state machine
@@ -55,9 +57,27 @@ const Node = struct {
     listed: bool = false,
 };
 
+/// Drive charges a *query cost* per user per minute, and a recursive walk of a real drive
+/// spends it in seconds — an indexer crawling a mounted vault is thousands of `files.list`
+/// calls. Past the limit Drive answers 403 to everything, including the folder the user is
+/// looking at, and a client that treats that as a permanent refusal turns a momentary
+/// over-spend into a broken mount.
+///
+/// So: the refusal is read for what it is (Google says `rateLimitExceeded` /
+/// `userRateLimitExceeded` / "Quota exceeded" in the body), every request in flight backs off
+/// together, and each one retries a few times before giving up. Backing off *together* is the
+/// point — sixteen crawlers each retrying on their own schedule is the same storm again.
+const retry_limit: u8 = 5;
+const retry_base_ms: i64 = 1_000;
+const retry_ceiling_ms: i64 = 30_000;
+
 pub const Client = struct {
     allocator: Allocator,
     transport: http.Transport,
+    /// For the retry clock. The host's `dvui.io`, passed in at init.
+    io: std.Io,
+    /// Boot-clock ms before which no request is sent: set when Drive says the quota is spent.
+    quiet_until_ms: i64 = 0,
     /// Refreshed by the host: the client reads it at request time, never copies it.
     access_token: []const u8,
     /// The Drive folder id the mount's `/` stands for. `"root"` is My Drive; a picked folder's
@@ -84,9 +104,10 @@ pub const Client = struct {
         return self.unauthorized;
     }
 
-    pub fn init(allocator: Allocator, transport: http.Transport, access_token: []const u8, root_id: []const u8) Allocator.Error!Client {
+    pub fn init(allocator: Allocator, io: std.Io, transport: http.Transport, access_token: []const u8, root_id: []const u8) Allocator.Error!Client {
         var self: Client = .{
             .allocator = allocator,
+            .io = io,
             .transport = transport,
             .access_token = access_token,
             .root_id = root_id,
@@ -271,7 +292,24 @@ pub const Client = struct {
     fn pump(ptr: *anyopaque) void {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.transport.pump();
+        self.retryWaiting();
         self.ready.drain(self, deliverOne);
+    }
+
+    fn nowMs(self: *Client) i64 {
+        return @intCast(@divTrunc(std.Io.Clock.boot.now(self.io).nanoseconds, std.time.ns_per_ms));
+    }
+
+    /// Re-issue the requests whose backoff has run out. Walked rather than queued: a job's whole
+    /// request is still on it (url, body, phase), so a retry is the same send again.
+    fn retryWaiting(self: *Client) void {
+        const now = self.nowMs();
+        if (now < self.quiet_until_ms) return;
+        for (self.jobs.values()) |job| {
+            if (job.retry_at_ms == 0 or now < job.retry_at_ms) continue;
+            job.retry_at_ms = 0;
+            job.resend() catch |err| job.finish(err);
+        }
     }
 
     fn deliverOne(self: *Client, job: *Job) void {
@@ -291,6 +329,16 @@ pub const Client = struct {
         job.url = url;
         job.body = body;
         job.body_owned = body_owned;
+        job.retry_method = method;
+        job.retry_content_type = content_type;
+
+        // Quiet period: hold this one rather than spending a quota that is already spent. It
+        // goes out with everything else when the wait is over (`retryWaiting`).
+        const now = self.nowMs();
+        if (now < self.quiet_until_ms) {
+            job.retry_at_ms = self.quiet_until_ms;
+            return;
+        }
         job.auth = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.access_token});
         job.header_count = 1;
         job.headers[0] = .{ .name = "Authorization", .value = job.auth };
@@ -308,6 +356,19 @@ pub const Client = struct {
 };
 
 /// One in-flight op. Owned by the client from `start` until delivered or cancelled.
+/// Whether this refusal is "you are going too fast" rather than "no". Google returns 429 for
+/// some of them and 403 for others, with the reason in the body — the status alone cannot tell
+/// a spent quota from a missing permission, and treating the two the same is how a mount breaks
+/// for the rest of the session.
+fn isRateLimited(status: u16, body: []const u8) bool {
+    if (status == 429) return true;
+    if (status != 403) return false;
+    return std.mem.indexOf(u8, body, "rateLimitExceeded") != null or
+        std.mem.indexOf(u8, body, "userRateLimitExceeded") != null or
+        std.mem.indexOf(u8, body, "Quota exceeded") != null or
+        std.mem.indexOf(u8, body, "quotaExceeded") != null;
+}
+
 const Job = struct {
     client: *Client,
     id: u64,
@@ -325,12 +386,21 @@ const Job = struct {
     /// The listed names, in Drive order, so `listDir` returns what this listing saw and not
     /// whatever the index accumulated.
     seen: std.ArrayList([]const u8) = .empty,
+    /// The same names (the same slices), for the duplicate check and `completeListing`.
+    seen_set: std.StringHashMapUnmanaged(void) = .empty,
     /// A changes poll's paths, accumulated across its pages. Owned (client allocator).
     changed: std.ArrayList([]u8) = .empty,
     /// A conditional write's `modifiedTime` check has come back and matched.
     write_checked: bool = false,
 
     pending: ?http.Job = null,
+    /// A rate-limited request waiting to be sent again: the boot-clock ms to send it at, and how
+    /// many times it has already been refused. Zero means nothing is waiting.
+    retry_at_ms: i64 = 0,
+    attempts: u8 = 0,
+    /// What `resend` repeats. The url and body are still on the job; this is the rest.
+    retry_method: http.Method = .GET,
+    retry_content_type: ?[]const u8 = null,
     url: []u8 = &.{},
     body: []const u8 = &.{},
     body_owned: ?[]u8 = null,
@@ -377,6 +447,7 @@ const Job = struct {
         if (job.pending) |p| job.client.transport.cancel(p);
         job.freeRequest();
         if (job.page_token) |t| a.free(t);
+        job.seen_set.deinit(a);
         for (job.seen.items) |name| a.free(name);
         job.seen.deinit(a);
         switch (job.result) {
@@ -402,6 +473,48 @@ const Job = struct {
         job.body = &.{};
         job.body_owned = null;
         job.pending = null;
+    }
+
+    /// Wait, then say it again. Gives up after `retry_limit` tries: a quota that has not come
+    /// back in half a minute of doubling is not about to, and an op that never answers is worse
+    /// than one that fails.
+    fn backOff(job: *Job) Fs.Error!void {
+        const client = job.client;
+        job.attempts += 1;
+        if (job.attempts >= retry_limit) {
+            std.log.warn("drive: gave up after {d} rate-limited tries: {s}", .{ job.attempts, job.url });
+            return error.Http;
+        }
+        // 1s, 2s, 4s, … capped. No jitter: every job shares one `quiet_until_ms`, so they are
+        // already spread by whatever order `retryWaiting` walks them in rather than by luck.
+        const shift: u6 = @intCast(@min(job.attempts - 1, 5));
+        const wait = @min(retry_base_ms << shift, retry_ceiling_ms);
+        const until = client.nowMs() + wait;
+        if (until > client.quiet_until_ms) client.quiet_until_ms = until;
+        job.retry_at_ms = client.quiet_until_ms;
+        if (job.attempts == 1) {
+            std.log.warn("drive: over Drive's per-minute quota; holding requests for {d}ms", .{wait});
+        }
+    }
+
+    /// Send this job's current request again, after a backoff. Everything it needs is still on
+    /// the job — `freeRequest` is what would have cleared it, and a waiting job has not been
+    /// through it.
+    fn resend(job: *Job) Fs.Error!void {
+        const self = job.client;
+        job.auth = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.access_token});
+        job.header_count = 1;
+        job.headers[0] = .{ .name = "Authorization", .value = job.auth };
+        if (job.retry_content_type) |ct| {
+            job.headers[1] = .{ .name = "Content-Type", .value = ct };
+            job.header_count = 2;
+        }
+        job.pending = try self.transport.request(self.allocator, .{
+            .method = job.retry_method,
+            .url = job.url,
+            .headers = job.headers[0..job.header_count],
+            .body = job.body,
+        }, Job.onResponse, job);
     }
 
     fn finish(job: *Job, err: Fs.Error) void {
@@ -516,8 +629,11 @@ const Job = struct {
             .changes => try job.requestChanges(),
             .list => {
                 if (node.kind != .dir) return error.NotADirectory;
-                // Always refetch — the caller is a cache and this is its miss path.
-                client.forgetChildren(job.path);
+                // Always refetch — the caller is a cache and this is its miss path. What the
+                // index already holds beneath it stays until the listing comes back and says
+                // which children are gone (`completeListing`): forgetting the subtree up front
+                // pulled it out from under every other op walking it — a vault scan's deeper
+                // listings then failed NotFound whenever anything re-listed an ancestor.
                 try job.beginListing(job.path);
             },
             .stat => job.complete(.{ .stat = .{ .kind = node.kind, .size = node.size, .modified_ms = node.modified_ms } }),
@@ -622,6 +738,11 @@ const Job = struct {
         switch (resp.status) {
             200...299 => {},
             else => {
+                // Spent quota, not a refusal: Drive says so in the body, and the same request a
+                // moment later succeeds. Everything in flight goes quiet together — one crawler
+                // retrying while fifteen others keep firing is the storm that spent it.
+                if (isRateLimited(resp.status, resp.body)) return job.backOff();
+
                 // Drive's error bodies say why (scope, disabled API, a wrong id); a bare
                 // error code would not.
                 std.log.warn("drive: {s} → HTTP {d}: {s}", .{ job.url, resp.status, resp.body[0..@min(resp.body.len, 400)] });
@@ -652,21 +773,36 @@ const Job = struct {
 
         const for_caller = job.op == .list and std.mem.eql(u8, job.listing, job.path);
         for (parsed.value.files) |file| {
-            const child = try Fs.path.join(a, job.listing, file.name);
             // First-listed wins: Drive allows siblings with one name; a path cannot.
-            if (client.index.contains(child)) {
-                a.free(child);
-                continue;
+            if (for_caller and job.seen_set.contains(file.name)) continue;
+            const child = try Fs.path.join(a, job.listing, file.name);
+            if (client.index.getPtr(child)) |node| {
+                if (!for_caller) {
+                    // An ancestor listed on the way to something else: what is known stays.
+                    a.free(child);
+                    continue;
+                }
+                if (std.mem.eql(u8, node.id, file.id)) {
+                    // The same file or folder as before: fresh metadata, and a folder keeps
+                    // what is known beneath it.
+                    a.free(child);
+                    const fresh = nodeFromFile(file, node.id);
+                    node.kind = fresh.kind;
+                    node.size = fresh.size;
+                    node.modified_ms = fresh.modified_ms;
+                    node.google_app = fresh.google_app;
+                    if (node.kind != .dir) client.forgetChildren(child);
+                    try job.noteSeen(file.name);
+                    continue;
+                }
+                // Another item now holds the name: nothing beneath the old one is its.
+                client.drop(child);
             }
             errdefer a.free(child);
             const id = try a.dupe(u8, file.id);
             errdefer a.free(id);
             try client.index.put(a, child, nodeFromFile(file, id));
-            if (for_caller) {
-                const name = try a.dupe(u8, file.name);
-                errdefer a.free(name);
-                try job.seen.append(a, name);
-            }
+            if (for_caller) try job.noteSeen(file.name);
         }
 
         if (job.page_token) |t| a.free(t);
@@ -685,9 +821,29 @@ const Job = struct {
         try job.stepInner();
     }
 
+    fn noteSeen(job: *Job, name: []const u8) Allocator.Error!void {
+        const a = job.client.allocator;
+        const copy = try a.dupe(u8, name);
+        errdefer a.free(copy);
+        try job.seen.append(a, copy);
+        errdefer _ = job.seen.pop();
+        try job.seen_set.put(a, copy, {});
+    }
+
     fn completeListing(job: *Job) Fs.Error!void {
         const client = job.client;
         const o = job.op.list;
+        // Children the index held from before that this listing did not return are gone.
+        {
+            var gone: std.ArrayList([]const u8) = .empty;
+            defer gone.deinit(client.allocator);
+            var it = client.index.keyIterator();
+            while (it.next()) |key| {
+                if (Fs.path.isRoot(key.*) or !std.mem.eql(u8, Fs.path.dirname(key.*), job.path)) continue;
+                if (!job.seen_set.contains(Fs.path.basename(key.*))) try gone.append(client.allocator, key.*);
+            }
+            for (gone.items) |key| client.drop(key);
+        }
         var entries: std.ArrayList(Fs.Entry) = .empty;
         errdefer {
             for (entries.items) |e| o.allocator.free(e.name);
