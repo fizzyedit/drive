@@ -32,6 +32,13 @@ const Allocator = std.mem.Allocator;
 pub const folder_mime = "application/vnd.google-apps.folder";
 pub const google_apps_prefix = "application/vnd.google-apps.";
 const api = "https://www.googleapis.com/drive/v3/files";
+
+/// Every request says it understands shared drives. Without it Drive answers as if they did not
+/// exist: a folder in one resolves by id (the metadata call is allowed) but listing its children
+/// comes back *empty rather than failing*, which reads as an empty folder. `includeItemsFromAllDrives`
+/// is only meaningful on a list, and Drive rejects it without `supportsAllDrives` beside it.
+const all_drives = "&supportsAllDrives=true";
+const all_drives_list = "&supportsAllDrives=true&includeItemsFromAllDrives=true";
 const upload_api = "https://www.googleapis.com/upload/drive/v3/files";
 const file_fields = "id,name,mimeType,size,modifiedTime";
 
@@ -490,12 +497,12 @@ const Job = struct {
         const a = client.allocator;
         job.phase = .request;
         const token = client.changes_token orelse {
-            const url = try a.dupe(u8, "https://www.googleapis.com/drive/v3/changes/startPageToken");
+            const url = try a.dupe(u8, "https://www.googleapis.com/drive/v3/changes/startPageToken?supportsAllDrives=true");
             return client.send(job, .GET, url, null, &.{}, null);
         };
         var url: std.ArrayList(u8) = .empty;
         errdefer url.deinit(a);
-        try url.appendSlice(a, "https://www.googleapis.com/drive/v3/changes?pageSize=1000&fields=newStartPageToken,nextPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,parents))&pageToken=");
+        try url.appendSlice(a, "https://www.googleapis.com/drive/v3/changes?pageSize=1000" ++ all_drives_list ++ "&fields=newStartPageToken,nextPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,parents))&pageToken=");
         try appendQueryValue(a, &url, token);
         try client.send(job, .GET, try url.toOwnedSlice(a), null, &.{}, null);
     }
@@ -517,7 +524,7 @@ const Job = struct {
             .read => {
                 if (node.kind != .file) return error.NotAFile;
                 if (node.google_app) return error.NotBinary;
-                const url = try std.fmt.allocPrint(a, "{s}/{s}?alt=media", .{ api, node.id });
+                const url = try std.fmt.allocPrint(a, "{s}/{s}?alt=media" ++ all_drives, .{ api, node.id });
                 job.phase = .request;
                 try client.send(job, .GET, url, null, &.{}, null);
             },
@@ -527,11 +534,11 @@ const Job = struct {
                 if (o.opts.if_unmodified_ms != null and !job.write_checked) {
                     // The index's modified time may be seconds stale; ask Drive for the live
                     // one before uploading over someone else's edit.
-                    const url = try std.fmt.allocPrint(a, "{s}/{s}?fields=modifiedTime", .{ api, node.id });
+                    const url = try std.fmt.allocPrint(a, "{s}/{s}?fields=modifiedTime" ++ all_drives, .{ api, node.id });
                     job.phase = .request;
                     return client.send(job, .GET, url, null, &.{}, null);
                 }
-                const url = try std.fmt.allocPrint(a, "{s}/{s}?uploadType=media&fields={s}", .{ upload_api, node.id, file_fields });
+                const url = try std.fmt.allocPrint(a, "{s}/{s}?uploadType=media&fields={s}" ++ all_drives, .{ upload_api, node.id, file_fields });
                 job.phase = .request;
                 try client.send(job, .PATCH, url, "application/octet-stream", o.bytes, null);
             },
@@ -546,7 +553,7 @@ const Job = struct {
                     .mimeType = if (o.kind == .dir) @as(?[]const u8, folder_mime) else null,
                 }, .{ .emit_null_optional_fields = false });
                 errdefer a.free(meta);
-                const url = try std.fmt.allocPrint(a, "{s}?fields={s}", .{ api, file_fields });
+                const url = try std.fmt.allocPrint(a, "{s}?fields={s}" ++ all_drives, .{ api, file_fields });
                 job.phase = .request;
                 try client.send(job, .POST, url, "application/json", meta, meta);
             },
@@ -566,9 +573,9 @@ const Job = struct {
                 errdefer a.free(meta);
                 // A plain rename keeps its parent; Google rejects add == remove.
                 const url = if (std.mem.eql(u8, node.id, old_parent.id))
-                    try std.fmt.allocPrint(a, "{s}/{s}?fields={s}", .{ api, src.id, file_fields })
+                    try std.fmt.allocPrint(a, "{s}/{s}?fields={s}" ++ all_drives, .{ api, src.id, file_fields })
                 else
-                    try std.fmt.allocPrint(a, "{s}/{s}?addParents={s}&removeParents={s}&fields={s}", .{ api, src.id, node.id, old_parent.id, file_fields });
+                    try std.fmt.allocPrint(a, "{s}/{s}?addParents={s}&removeParents={s}&fields={s}" ++ all_drives, .{ api, src.id, node.id, old_parent.id, file_fields });
                 job.phase = .request;
                 try client.send(job, .PATCH, url, "application/json", meta, meta);
             },
@@ -582,7 +589,7 @@ const Job = struct {
                 }
                 const meta = try std.json.Stringify.valueAlloc(a, .{ .trashed = true }, .{});
                 errdefer a.free(meta);
-                const url = try std.fmt.allocPrint(a, "{s}/{s}?fields=id", .{ api, node.id });
+                const url = try std.fmt.allocPrint(a, "{s}/{s}?fields=id" ++ all_drives, .{ api, node.id });
                 job.phase = .request;
                 try client.send(job, .PATCH, url, "application/json", meta, meta);
             },
@@ -941,7 +948,7 @@ fn buildListUrl(allocator: Allocator, dir_id: []const u8, page_token: ?[]const u
     try appendQueryValue(allocator, &q, "'");
     try appendQueryValue(allocator, &q, dir_id);
     try appendQueryValue(allocator, &q, "' in parents and trashed=false");
-    try q.appendSlice(allocator, "&fields=nextPageToken,files(" ++ file_fields ++ ")&pageSize=1000");
+    try q.appendSlice(allocator, "&fields=nextPageToken,files(" ++ file_fields ++ ")&pageSize=1000" ++ all_drives_list);
     if (page_token) |token| {
         try q.appendSlice(allocator, "&pageToken=");
         try appendQueryValue(allocator, &q, token);
