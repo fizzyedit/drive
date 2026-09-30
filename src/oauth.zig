@@ -56,17 +56,18 @@ pub fn redirectUri(buf: *[40]u8, port: u16) []const u8 {
 
 /// The browser URL for the web build's implicit flow: the access token comes back in the
 /// fragment of `redirect_uri` (fizzy's `oauth-callback.html`), no exchange, no secret. Caller
-/// owns. `silent` asks Google to answer without a prompt — for renewing an expired token.
-pub fn implicitAuthUrl(allocator: std.mem.Allocator, client_id: []const u8, scope: []const u8, redirect_uri: []const u8, state: []const u8, silent: bool) ![]u8 {
+/// owns. `login_hint`, when not empty, names the account to use, so Google can skip its
+/// chooser.
+pub fn implicitAuthUrl(allocator: std.mem.Allocator, client_id: []const u8, scope: []const u8, redirect_uri: []const u8, state: []const u8, login_hint: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, auth_endpoint ++ "?response_type=token");
-    if (silent) try out.appendSlice(allocator, "&prompt=none");
     try out.appendSlice(allocator, "&include_granted_scopes=true");
     try appendParam(allocator, &out, "client_id", client_id);
     try appendParam(allocator, &out, "redirect_uri", redirect_uri);
     try appendParam(allocator, &out, "scope", scope);
     try appendParam(allocator, &out, "state", state);
+    if (login_hint.len != 0) try appendParam(allocator, &out, "login_hint", login_hint);
     return out.toOwnedSlice(allocator);
 }
 

@@ -10,8 +10,10 @@
 //! loopback listener for the code, a token exchange, and a refresh token kept in settings so
 //! the next launch signs in silently. Web: Google Identity Services' token client (Google will
 //! not exchange a code from a browser without a secret), which hands over an hour's access
-//! token and is asked again, silently, before it runs out. Both end in the same place:
-//! `mount("gdrive://<email>")`.
+//! token. The web keeps that token, not a refresh token, in the host's secret store, so a
+//! reload within the hour mounts again with no popup; after it, a browser only lets a popup
+//! open from a click, so the drive asks to be reconnected rather than trying on its own. Both
+//! end in the same place: `mount("gdrive://<email>")`.
 const std = @import("std");
 const builtin = @import("builtin");
 const sdk = @import("fizzy_sdk");
@@ -81,6 +83,9 @@ const State = struct {
     access_token: []u8 = &.{},
     /// Boot-clock ms after which `access_token` is no longer trusted.
     expires_at_ms: i64 = 0,
+    /// Web: the hour's token has run out (or had by the time the page loaded) and only a click
+    /// may open the popup that gets another, so the File menu offers to reconnect.
+    reconnect: bool = false,
     account: []u8 = &.{},
     /// `gdrive://<account>` while mounted. Owned.
     prefix: []u8 = &.{},
@@ -206,6 +211,7 @@ fn initPlugin(ptr: *anyopaque) anyerror!void {
     // A saved refresh token (the host's secret store) means the user signed in before: pick
     // up where they left off.
     if (!is_wasm and refreshToken(st).len != 0) startRefresh(st);
+    if (is_wasm) restoreWebToken(st);
 }
 
 pub fn pluginPtr() *sdk.Plugin {
@@ -248,6 +254,40 @@ fn storeRefreshToken(value: []const u8) void {
     };
 }
 
+/// Web: the hour's access token and when it runs out, as `<unix ms> <token>`. Wall-clock time,
+/// unlike `expires_at_ms`, because it has to mean the same thing after a reload.
+const secret_web_token = "drive.web_token";
+
+fn storeWebToken(token: []const u8, expires_in: i64) void {
+    const value = if (token.len == 0) "" else std.fmt.allocPrint(sdk.host().arena(), "{d} {s}", .{ wallMs() + expires_in * 1000, token }) catch return;
+    sdk.host().setSecret(secret_web_token, value) catch {};
+}
+
+/// A token saved by an earlier page that still has a few minutes in it signs in without a
+/// popup. One that has run out leaves the drive signed out, with Reconnect offered when there
+/// was an account.
+fn restoreWebToken(st: *State) void {
+    const saved = sdk.host().getSecret(secret_web_token) orelse "";
+    const space = std.mem.indexOfScalar(u8, saved, ' ') orelse {
+        if (st.settings.account.get().len != 0) st.reconnect = true;
+        return;
+    };
+    const expires_ms = std.fmt.parseInt(i64, saved[0..space], 10) catch 0;
+    const left_ms = expires_ms - wallMs();
+    if (left_ms < 180_000) {
+        storeWebToken("", 0);
+        if (st.settings.account.get().len != 0) st.reconnect = true;
+        return;
+    }
+    setToken(st, saved[space + 1 ..], @divTrunc(left_ms, 1000));
+    st.phase = .token;
+    afterToken(st);
+}
+
+fn wallMs() i64 {
+    return @intCast(@divTrunc(std.Io.Clock.real.now(dvui.io).nanoseconds, std.time.ns_per_ms));
+}
+
 /// The whole drive, and it has to be.
 ///
 /// `drive.file` — access to what the user hands over, one item at a time — cannot support a
@@ -275,8 +315,8 @@ fn cmdSignIn(ptr: *anyopaque) anyerror!void {
 fn cmdSignInEnabled(ptr: *anyopaque) bool {
     // Also while a browser tab is open: choosing Connect again abandons that attempt and
     // starts over, which is what someone whose first try ended on a Google error page wants.
-    const phase = stateOf(ptr).phase;
-    return phase == .signed_out or phase == .awaiting_code;
+    const st = stateOf(ptr);
+    return st.phase == .signed_out or st.phase == .awaiting_code or st.reconnect;
 }
 fn cmdSignOut(ptr: *anyopaque) anyerror!void {
     signOut(stateOf(ptr), true);
@@ -315,6 +355,10 @@ fn nativeSignIn(_: ?*anyopaque) anyerror!void {
 fn drawFileMenuSection(_: ?*anyopaque) anyerror!void {
     const st = stateOf(plugin.state);
     const host = sdk.host();
+    if (st.reconnect and st.settings.account.get().len != 0) {
+        const label = std.fmt.allocPrint(host.arena(), "Reconnect Google Drive ({s})", .{st.settings.account.get()}) catch "Reconnect Google Drive";
+        if (host.drawMenuItem(label, sdk.Plugin.commandId(plugin_id, "sign_in"))) signIn(st);
+    }
     if (st.phase == .signed_out) {
         if (host.drawMenuItem("Connect Google Drive…", sdk.Plugin.commandId(plugin_id, "sign_in"))) signIn(st);
     } else if (st.phase == .awaiting_code) {
@@ -363,7 +407,12 @@ fn beginFrame(ptr: *anyopaque) void {
         if (client.takeUnauthorized()) stale = true;
     }
     if (mounted(st) and st.pending == null and stale) {
-        if (is_wasm) requestWebToken(st, true) else startRefresh(st);
+        if (!is_wasm) {
+            startRefresh(st);
+        } else if (!st.reconnect) {
+            st.reconnect = true;
+            complain("Google Drive's session ended; choose Reconnect Google Drive in the File menu");
+        }
     }
 }
 
@@ -377,6 +426,11 @@ fn needsContinuousRepaint(ptr: *anyopaque) bool {
 
 fn signIn(st: *State) void {
     if (!st.ready) return complain("Google Drive is still starting; try again in a moment.");
+    // Web, mounted, token run out: a new token for the same drive, nothing else changes.
+    if (is_wasm and st.reconnect and st.phase == .mounted) {
+        st.interactive = false;
+        return requestWebToken(st);
+    }
     // A retry while the previous browser tab is still open: drop that attempt first.
     if (st.phase == .awaiting_code) signOut(st, false);
     if (st.phase != .signed_out) return;
@@ -386,7 +440,7 @@ fn signIn(st: *State) void {
         st.phase = .token;
         // Connect and choose in one trip, as on the desktop: `drive.file` gives an account
         // with nothing picked no view of anything.
-        requestWebToken(st, false);
+        requestWebToken(st);
         return;
     }
     if (credentials.client_id.len == 0) return complain("This build of the Drive plugin has no OAuth client configured.");
@@ -825,6 +879,8 @@ fn signOut(st: *State, forget: bool) void {
     st.phase = .signed_out;
     st.interactive = false;
     if (forget) {
+        st.reconnect = false;
+        if (is_wasm) storeWebToken("", 0);
         storeRefreshToken("");
         setSetting(st, "account", "");
         setSetting(st, "root_folder_id", "root");
@@ -878,6 +934,11 @@ fn fail(st: *State, what: []const u8) void {
         st.expires_at_ms = nowMs() + 120_000 + 60_000;
         return;
     }
+    // Web: a saved token that got this far without mounting is not one to try again next load.
+    if (is_wasm) {
+        storeWebToken("", 0);
+        if (st.settings.account.get().len != 0) st.reconnect = true;
+    }
     signOut(st, false);
 }
 
@@ -915,7 +976,7 @@ fn setSetting(st: *State, comptime field: []const u8, value: []const u8) void {
 // token in the fragment. Nothing Google-specific lives in fizzy for this; the popup helper is
 // the same one any provider's plugin would use.
 
-fn requestWebToken(st: *State, silent: bool) void {
+fn requestWebToken(st: *State) void {
     if (!is_wasm) return;
     const gpa = sdk.allocator();
     const redirect = core.transport.WebOAuth.callbackUrl(gpa) catch return fail(st, "no callback page");
@@ -927,7 +988,8 @@ fn requestWebToken(st: *State, silent: bool) void {
         _ = std.base64.url_safe_no_pad.Encoder.encode(state_buf, &nonce);
         st.web_state = state_buf;
     }
-    const url = oauth.implicitAuthUrl(gpa, credentials.web_client_id, scopeOf(st), redirect, st.web_state, silent) catch return fail(st, "out of memory");
+    // The account signed in before, so Google can skip asking which one.
+    const url = oauth.implicitAuthUrl(gpa, credentials.web_client_id, scopeOf(st), redirect, st.web_state, st.settings.account.get()) catch return fail(st, "out of memory");
     defer gpa.free(url);
     core.transport.WebOAuth.begin(gpa, url, onWebOAuth, st) catch return fail(st, "a sign-in is already open");
 }
@@ -941,5 +1003,7 @@ fn onWebOAuth(ctx: ?*anyopaque, result: ?[]u8) void {
     const parsed = oauth.parseImplicit(text) orelse return fail(st, "Google refused the sign-in");
     if (!std.mem.eql(u8, parsed.state, st.web_state)) return fail(st, "sign-in reply did not match the request");
     setToken(st, parsed.access_token, parsed.expires_in);
+    storeWebToken(parsed.access_token, parsed.expires_in);
+    st.reconnect = false;
     afterToken(st);
 }
