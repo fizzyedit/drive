@@ -775,7 +775,8 @@ fn prefetchOpenFolder(st: *State) void {
     st.prefetch_stat = client.fs().stat(rel, onPrefetchStat, st) catch null;
 }
 
-fn onPrefetchStat(ctx: ?*anyopaque, result: vfs.Error!vfs.Stat) void {
+fn onPrefetchStat(ctx: ?*anyopaque, answer: vfs.Result(vfs.Stat)) void {
+    const result = answer.get();
     const st: *State = @ptrCast(@alignCast(ctx.?));
     st.prefetch_stat = null;
     const s = result catch return;

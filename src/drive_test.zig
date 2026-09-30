@@ -96,7 +96,8 @@ const Sink = struct {
         if (self.bytes) |b| self.allocator.free(b);
         self.* = .{ .allocator = self.allocator };
     }
-    fn onList(ctx: ?*anyopaque, result: Fs.Error![]Fs.Entry) void {
+    fn onList(ctx: ?*anyopaque, answer: Fs.Result([]Fs.Entry)) void {
+        const result = answer.get();
         const self: *Sink = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
         self.entries = result catch |err| {
@@ -104,7 +105,8 @@ const Sink = struct {
             return;
         };
     }
-    fn onStat(ctx: ?*anyopaque, result: Fs.Error!Fs.Stat) void {
+    fn onStat(ctx: ?*anyopaque, answer: Fs.Result(Fs.Stat)) void {
+        const result = answer.get();
         const self: *Sink = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
         self.stat = result catch |err| {
@@ -112,7 +114,8 @@ const Sink = struct {
             return;
         };
     }
-    fn onRead(ctx: ?*anyopaque, result: Fs.Error!Fs.Read) void {
+    fn onRead(ctx: ?*anyopaque, answer: Fs.Result(Fs.Read)) void {
+        const result = answer.get();
         const self: *Sink = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
         const r = result catch |err| {
@@ -122,7 +125,8 @@ const Sink = struct {
         self.bytes = r.bytes;
         self.modified_ms = r.modified_ms;
     }
-    fn onDone(ctx: ?*anyopaque, result: Fs.Error!void) void {
+    fn onDone(ctx: ?*anyopaque, answer: Fs.Result(void)) void {
+        const result = answer.get();
         const self: *Sink = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
         result catch |err| {

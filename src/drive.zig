@@ -419,7 +419,7 @@ pub const Client = struct {
         self.changes_token = copy;
     }
 
-    const vtable: Fs.Fs.VTable = .{
+    const vtable: Fs.Fs.VTable = .of(.{
         .listDir = startListDir,
         .stat = startStat,
         .readFile = startReadFile,
@@ -430,7 +430,7 @@ pub const Client = struct {
         .remove = startRemove,
         .cancel = cancel,
         .pump = pump,
-    };
+    });
 
     fn startListDir(ptr: *anyopaque, allocator: Allocator, path: []const u8, cb: Fs.ListDirFn, ctx: ?*anyopaque) Fs.Error!Fs.Job {
         const self: *Client = @ptrCast(@alignCast(ptr));
@@ -853,21 +853,21 @@ const Job = struct {
         const result = job.result;
         job.result = .pending;
         switch (job.op) {
-            .list => |o| o.cb(o.ctx, switch (result) {
+            .list => |o| o.cb(o.ctx, .of(switch (result) {
                 .entries => |e| e,
                 .err => |e| e,
                 else => unreachable,
-            }),
-            .stat => |o| o.cb(o.ctx, switch (result) {
+            })),
+            .stat => |o| o.cb(o.ctx, .of(switch (result) {
                 .stat => |s| s,
                 .err => |e| e,
                 else => unreachable,
-            }),
-            .read => |o| o.cb(o.ctx, switch (result) {
+            })),
+            .read => |o| o.cb(o.ctx, .of(switch (result) {
                 .read => |r| r,
                 .err => |e| e,
                 else => unreachable,
-            }),
+            })),
             .changes => |o| o.cb(o.ctx, switch (result) {
                 .changed => |c| c,
                 .err => |e| e,
@@ -878,11 +878,11 @@ const Job = struct {
                 .err => |e| e,
                 else => unreachable,
             }),
-            inline .write, .create, .rename, .remove => |o| o.cb(o.ctx, switch (result) {
+            inline .write, .create, .rename, .remove => |o| o.cb(o.ctx, .of(switch (result) {
                 .ok => {},
                 .err => |e| e,
                 else => unreachable,
-            }),
+            })),
         }
     }
 
