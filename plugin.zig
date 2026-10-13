@@ -44,7 +44,6 @@ const vtable: sdk.Plugin.VTable = .{
     .initPlugin = initPlugin,
     .beginFrame = beginFrame,
     .needsContinuousRepaint = needsContinuousRepaint,
-    .onFolderOpen = onFolderOpen,
 };
 
 const Schema = sdk.settings.Schema(Settings);
@@ -127,6 +126,7 @@ pub fn register(host: *sdk.Host) !void {
     plugin.state = @ptrCast(st);
 
     try host.registerPlugin(&plugin);
+    try host.subscribe(.{ .event = "fizzy.folder.opened", .owner = &plugin, .handler = folderOpened });
     try Schema.register(host, &plugin, .{ .title = "Google Drive", .value = &st.settings });
 
     try host.registerCommand(.{
@@ -772,7 +772,7 @@ fn onChanges(ctx: ?*anyopaque, result: vfs.Error![]drive.Change) void {
     // indexed from this drive re-reads exactly what changed instead of re-walking the drive.
     // Anything outside the open folder only needs the table's listings dropped.
     const folder = host.folder();
-    var events: std.ArrayList(sdk.Plugin.PathEvent) = .empty;
+    var events: std.ArrayList(sdk.events.PathEvent) = .empty;
     for (changes) |c| {
         const full = mountPath(arena, st.prefix, c.path) catch continue;
         const old = if (c.old_path.len != 0) mountPath(arena, st.prefix, c.old_path) catch continue else "";
@@ -838,7 +838,8 @@ fn onPrefetchStat(ctx: ?*anyopaque, answer: vfs.Result(vfs.Stat)) void {
     prefetchOpenFolder(st);
 }
 
-fn onFolderOpen(ptr: *anyopaque, _: std.mem.Allocator) void {
+/// `fizzy.folder.opened`: a folder on the drive gets its first listing fetched ahead.
+fn folderOpened(ptr: *anyopaque, _: sdk.events.Event) void {
     prefetchOpenFolder(stateOf(ptr));
 }
 
