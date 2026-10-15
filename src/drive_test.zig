@@ -158,7 +158,7 @@ const notes_page =
 const little_drive = [_]Scripted.Route{
     .{ .contains = "changes/startPageToken", .body = "{\"startPageToken\":\"100\"}" },
     .{ .contains = "changes?", .body =
-        \\{"newStartPageToken":"101","changes":[{"fileId":"a1","removed":false,"file":{"id":"a1","name":"a.txt","parents":["n1"]}},{"fileId":"zz","removed":false,"file":{"id":"zz","name":"new.md","mimeType":"text/markdown","parents":["root"]}}]}
+    \\{"newStartPageToken":"101","changes":[{"fileId":"a1","removed":false,"file":{"id":"a1","name":"a.txt","parents":["n1"]}},{"fileId":"zz","removed":false,"file":{"id":"zz","name":"new.md","mimeType":"text/markdown","parents":["root"]}}]}
     },
     .{ .contains = "pageToken=p2", .body = root_page2 },
     .{ .contains = "q=%27root%27%20in%20parents", .body = root_page1 },
@@ -167,18 +167,18 @@ const little_drive = [_]Scripted.Route{
     // The live metadata says someone saved a.txt a day after the listing.
     .{ .contains = "files/a1?fields=modifiedTime", .method = .GET, .body = "{\"modifiedTime\":\"2024-01-02T00:00:00Z\"}" },
     .{ .contains = "files/d1?alt=media", .body = "never" },
-    .{ .contains = "upload/drive/v3/files/a1?uploadType=media", .method = .PATCH, .body = 
-        \\{"id":"a1","name":"a.txt","mimeType":"text/plain","size":"3","modifiedTime":"2024-06-01T00:00:00Z"}
+    .{ .contains = "upload/drive/v3/files/a1?uploadType=media", .method = .PATCH, .body =
+    \\{"id":"a1","name":"a.txt","mimeType":"text/plain","size":"3","modifiedTime":"2024-06-01T00:00:00Z"}
     },
     .{ .contains = "files?fields=", .method = .POST, .body =
-        \\{"id":"new1","name":"b.txt","mimeType":"text/plain","size":"0"}
+    \\{"id":"new1","name":"b.txt","mimeType":"text/plain","size":"0"}
     },
-    .{ .contains = "addParents=", .method = .PATCH, .body = 
-        \\{"id":"a1","name":"renamed.txt","mimeType":"text/plain","size":"7"}
+    .{ .contains = "addParents=", .method = .PATCH, .body =
+    \\{"id":"a1","name":"renamed.txt","mimeType":"text/plain","size":"7"}
     },
     .{ .contains = "?fields=id", .method = .PATCH, .body = "{\"id\":\"x\"}" },
     .{ .contains = "files/a1?fields=", .method = .PATCH, .body =
-        \\{"id":"a1","name":"b.txt","mimeType":"text/plain","size":"7"}
+    \\{"id":"a1","name":"b.txt","mimeType":"text/plain","size":"7"}
     },
 };
 
@@ -435,7 +435,7 @@ test "changes: the first poll takes a start token, the next folds changes into t
 test "duplicate sibling names: first listed wins" {
     const dup = [_]Scripted.Route{
         .{ .contains = "in%20parents", .body =
-            \\{"files":[{"id":"x1","name":"same.txt","mimeType":"text/plain","size":"1"},{"id":"x2","name":"same.txt","mimeType":"text/plain","size":"2"}]}
+        \\{"files":[{"id":"x1","name":"same.txt","mimeType":"text/plain","size":"1"},{"id":"x2","name":"same.txt","mimeType":"text/plain","size":"2"}]}
         },
         .{ .contains = "files/x1?alt=media", .body = "first" },
     };
@@ -514,12 +514,12 @@ test "a re-list drops children that are gone and keeps a surviving folder's subt
     // same folder again, with `top.txt` back.
     const replaced = [_]Scripted.Route{
         .{ .contains = "q=%27root%27%20in%20parents", .body =
-            \\{"files":[{"id":"n2","name":"notes","mimeType":"application/vnd.google-apps.folder"}]}
+        \\{"files":[{"id":"n2","name":"notes","mimeType":"application/vnd.google-apps.folder"}]}
         },
     };
     const same = [_]Scripted.Route{
         .{ .contains = "q=%27root%27%20in%20parents", .body =
-            \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","modifiedTime":"2024-03-01T00:00:00Z"},{"id":"t1","name":"top.txt","mimeType":"text/plain","size":"9"}]}
+        \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","modifiedTime":"2024-03-01T00:00:00Z"},{"id":"t1","name":"top.txt","mimeType":"text/plain","size":"9"}]}
         },
     };
 
@@ -584,8 +584,8 @@ test "a spent quota is retried, not reported as a refusal" {
 test "a refusal that is not a quota is still a refusal" {
     const a = std.testing.allocator;
     const h = try Harness.init(a, &.{
-        .{ .contains = "files?q=", .status = 403, .body = 
-            \\{"error":{"code":403,"message":"Insufficient permission","errors":[{"reason":"insufficientPermissions"}]}}
+        .{ .contains = "files?q=", .status = 403, .body =
+        \\{"error":{"code":403,"message":"Insufficient permission","errors":[{"reason":"insufficientPermissions"}]}}
         },
     });
     defer h.deinit();
@@ -613,8 +613,8 @@ test "a folder that came back as a file forgets what was beneath it" {
     // Same id `n1`, same name, now a plain file.
     const notes_is_a_file = [_]Scripted.Route{
         .{ .contains = "pageToken=p2", .body = root_page2 },
-        .{ .contains = "q=%27root%27%20in%20parents", .body = 
-            \\{"nextPageToken":"p2","files":[{"id":"n1","name":"notes","mimeType":"text/plain","size":"3"}]}
+        .{ .contains = "q=%27root%27%20in%20parents", .body =
+        \\{"nextPageToken":"p2","files":[{"id":"n1","name":"notes","mimeType":"text/plain","size":"3"}]}
         },
     };
     h.scripted.routes = &notes_is_a_file;
@@ -638,24 +638,24 @@ test "a folder that came back as a file forgets what was beneath it" {
 // accepted in a query and never reported back.
 const walk_drive = [_]Scripted.Route{
     .{ .contains = "q=%28%27root%27%20in%20parents%29", .body =
-        \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","parents":["0Aroot"]},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder","parents":["0Aroot"]},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3","parents":["0Aroot"]}]}
+    \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder","parents":["0Aroot"]},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder","parents":["0Aroot"]},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3","parents":["0Aroot"]}]}
     },
     // Both of root's folders in one query, answered in one page.
     .{ .contains = "q=%28%27n1%27%20in%20parents%20or%20%27m1%27%20in%20parents%29", .body =
-        \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","size":"5","parents":["n1"]},{"id":"s1","name":"sub","mimeType":"application/vnd.google-apps.folder","parents":["n1"]},{"id":"b1","name":"b.md","mimeType":"text/markdown","size":"6","parents":["m1"]}]}
+    \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","size":"5","parents":["n1"]},{"id":"s1","name":"sub","mimeType":"application/vnd.google-apps.folder","parents":["n1"]},{"id":"b1","name":"b.md","mimeType":"text/markdown","size":"6","parents":["m1"]}]}
     },
     .{ .contains = "q=%28%27s1%27%20in%20parents%29", .body =
-        \\{"files":[{"id":"d1","name":"deep.md","mimeType":"text/markdown","size":"7","parents":["s1"]}]}
+    \\{"files":[{"id":"d1","name":"deep.md","mimeType":"text/markdown","size":"7","parents":["s1"]}]}
     },
     // One folder on its own — a listing that did not wait for the walk.
     .{ .contains = "q=%27root%27%20in%20parents", .body =
-        \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder"},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder"},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3"}]}
+    \\{"files":[{"id":"n1","name":"notes","mimeType":"application/vnd.google-apps.folder"},{"id":"m1","name":"more","mimeType":"application/vnd.google-apps.folder"},{"id":"t1","name":"top.md","mimeType":"text/markdown","size":"3"}]}
     },
     .{ .contains = "q=%27n1%27%20in%20parents", .body =
-        \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","size":"5"},{"id":"s1","name":"sub","mimeType":"application/vnd.google-apps.folder"}]}
+    \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","size":"5"},{"id":"s1","name":"sub","mimeType":"application/vnd.google-apps.folder"}]}
     },
     .{ .contains = "q=%27s1%27%20in%20parents", .body =
-        \\{"files":[{"id":"d1","name":"deep.md","mimeType":"text/markdown","size":"7"}]}
+    \\{"files":[{"id":"d1","name":"deep.md","mimeType":"text/markdown","size":"7"}]}
     },
 };
 
@@ -788,10 +788,10 @@ test "a refused batch is asked again in halves" {
         // The two-folder query is "too complex"; each folder alone is fine.
         .{ .contains = "q=%28%27n1%27%20in%20parents%20or", .status = 400, .body = "{\"error\":{\"message\":\"The query is too complex.\"}}" },
         .{ .contains = "q=%28%27n1%27%20in%20parents%29", .body =
-            \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","parents":["n1"]}]}
+        \\{"files":[{"id":"a1","name":"a.md","mimeType":"text/markdown","parents":["n1"]}]}
         },
         .{ .contains = "q=%28%27m1%27%20in%20parents%29", .body =
-            \\{"files":[{"id":"b1","name":"b.md","mimeType":"text/markdown","parents":["m1"]}]}
+        \\{"files":[{"id":"b1","name":"b.md","mimeType":"text/markdown","parents":["m1"]}]}
         },
     };
     const h = try Harness.init(std.testing.allocator, &routes);
