@@ -191,7 +191,6 @@ pub fn register(host: *sdk.Host) !void {
             .run = nativeSignIn,
         });
     }
-
 }
 
 /// After the host injected its dvui globals: the transport (which keeps `dvui.io`), and the

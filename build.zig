@@ -27,7 +27,10 @@ pub fn build(b: *std.Build) void {
 /// strings when those are unset too, which builds a plugin that can only say "not configured".
 fn ensureCredentials(b: *std.Build) void {
     const io = b.graph.io;
-    if (b.build_root.handle.access(io, "credentials.zon", .{})) |_| return else |_| {}
+    // Declared either way, so a credentials.zon edited later reconfigures. The environment is
+    // read only to write a missing one: Zig 0.17 caches the configuration without regard to it.
+    defer b.dependOnFileContents(b.path("credentials.zon"));
+    if (b.root.access(io, "credentials.zon", .{})) |_| return else |_| {}
     const id = b.graph.environ_map.get("FIZZY_DRIVE_CLIENT_ID") orelse "";
     const secret = b.graph.environ_map.get("FIZZY_DRIVE_CLIENT_SECRET") orelse "";
     const web_id = b.graph.environ_map.get("FIZZY_DRIVE_WEB_CLIENT_ID") orelse "";
@@ -40,7 +43,8 @@ fn ensureCredentials(b: *std.Build) void {
         \\}}
         \\
     , .{ id, secret, web_id });
-    b.build_root.handle.writeFile(io, .{ .sub_path = "credentials.zon", .data = text }) catch |err| {
+    const path = b.root.joinString(b.allocator, "credentials.zon") catch @panic("OOM");
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch |err| {
         std.debug.panic("drive: could not write credentials.zon: {t}", .{err});
     };
     if (id.len == 0) std.debug.print("drive: no credentials.zon and FIZZY_DRIVE_CLIENT_ID unset — the plugin will refuse to sign in until one is provided\n", .{});
